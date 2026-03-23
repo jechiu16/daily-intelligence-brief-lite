@@ -1,0 +1,35 @@
+name: Daily Macro Brief
+
+on:
+  schedule:
+    # Every day at 00:00 UTC = 08:00 Taiwan Time (UTC+8)
+    - cron: "0 0 * * 1-5"   # Weekdays only (Mon–Fri)
+    # To include weekends, change to:  "0 0 * * *"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  generate-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install anthropic httpx
+
+      - name: Generate and push brief to Notion
+        env:
+          ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
+          NOTION_API_KEY:       ${{ secrets.NOTION_API_KEY }}
+          NOTION_DATABASE_ID:   ${{ secrets.NOTION_DATABASE_ID }}
+          NOTION_WEEKLY_DB_ID:  ${{ secrets.NOTION_WEEKLY_DB_ID }}
+        run: python generate_brief.py
