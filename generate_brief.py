@@ -282,56 +282,110 @@ def call_claude(system: str, user: str, max_tokens: int = 4096) -> str:
 
 
 # ── Notion rich_text helpers ──────────────────────────────────────────────────
-def clean_content(text: str) -> str:
-    """Remove bare 'List' placeholders Claude sometimes generates."""
-    text = re.sub(r'^[-*]\s+List\s*$', '', text, flags=re.MULTILINE)
-    text = re.sub(r'^List\s*$', '', text, flags=re.MULTILINE)
-    return text.strip()
+def clean_md(md: str) -> str:
+    """
+    Pre-process markdown before converting to Notion blocks.
+    - Remove bare 'List' / '- List' placeholder lines Claude sometimes emits
+    - Normalize bullet markers to '- '
+    - Strip trailing whitespace per line
+    """
+    lines = []
+    for line in md.split("\n"):
+        stripped = line.strip()
+        # Drop bare placeholder lines: '- List', '* List', 'List', '- list' etc.
+        if re.match(r'^[-*]?\s*[Ll]ist\s*$', stripped):
+            continue
+        # Normalize '* ' bullets to '- '
+        if line.startswith("* "):
+            line = "- " + line[2:]
+        lines.append(line.rstrip())
+    return "\n".join(lines)
 
 
 def parse_inline(text: str) -> list:
-    rich    = []
+    """Convert inline markdown (**bold**, *italic*) to Notion rich_text array."""
+    rich = []
+    # Match **bold**, *italic*, or plain text segments
     pattern = re.compile(r'\*\*(.+?)\*\*|\*(.+?)\*|([^*]+)', re.DOTALL)
     for m in pattern.finditer(text):
         bold_t, italic_t, plain_t = m.group(1), m.group(2), m.group(3)
         if bold_t:
-            content, ann = bold_t, {"bold": True}
+            seg_content, ann = bold_t, {"bold": True}
         elif italic_t:
-            content, ann = italic_t, {"italic": True}
+            seg_content, ann = italic_t, {"italic": True}
         else:
-            content, ann = plain_t, {}
-        for i in range(0, len(content), 2000):
-            rt = {"type": "text", "text": {"content": content[i:i+2000]}}
+            seg_content, ann = plain_t, {}
+        # Notion rich_text items max 2000 chars
+        for i in range(0, max(1, len(seg_content)), 2000):
+            chunk = seg_content[i:i+2000]
+            if not chunk:
+                continue
+            rt = {"type": "text", "text": {"content": chunk}}
             if ann:
                 rt["annotations"] = ann
             rich.append(rt)
     return rich or [{"type": "text", "text": {"content": ""}}]
 
 
+def md_block(btype: str, rich: list) -> dict:
+    """Helper: build a Notion block dict."""
+    return {"object": "block", "type": btype, btype: {"rich_text": rich}}
+
+
 def markdown_to_notion_blocks(md: str) -> list:
-    md = clean_content(md)
+    """
+    Convert a markdown string to a list of Notion block dicts.
+    Handles: h1/h2/h3, bullet lists, numbered lists, dividers, paragraphs.
+    Tables are converted to bullet points.
+    All 'List' placeholder lines are removed before processing.
+    """
+    md = clean_md(md)
     blocks = []
+
     for line in md.split("\n"):
+        # ── Headings ──────────────────────────────────────────────────────────
         if line.startswith("# "):
-            blocks.append({"object":"block","type":"heading_1","heading_1":{"rich_text":parse_inline(line[2:].strip())}})
+            blocks.append(md_block("heading_1", parse_inline(line[2:].strip())))
         elif line.startswith("## "):
-            blocks.append({"object":"block","type":"heading_2","heading_2":{"rich_text":parse_inline(line[3:].strip())}})
+            blocks.append(md_block("heading_2", parse_inline(line[3:].strip())))
         elif line.startswith("### "):
-            blocks.append({"object":"block","type":"heading_3","heading_3":{"rich_text":parse_inline(line[4:].strip())}})
-        elif line.strip().startswith("---"):
-            blocks.append({"object":"block","type":"divider","divider":{}})
-        elif line.startswith("- ") or line.startswith("* "):
-            blocks.append({"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text":parse_inline(line[2:].strip())}})
-        elif re.match(r'^\d+\. ', line):
-            blocks.append({"object":"block","type":"numbered_list_item","numbered_list_item":{"rich_text":parse_inline(re.sub(r'^\d+\. ','',line).strip())}})
+            blocks.append(md_block("heading_3", parse_inline(line[4:].strip())))
+
+        # ── Divider ───────────────────────────────────────────────────────────
+        elif re.match(r"^-{3,}$", line.strip()):
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+
+        # ── Bullet list ───────────────────────────────────────────────────────
+        elif line.startswith("- "):
+            text = line[2:].strip()
+            if text:  # skip if content is empty after stripping
+                blocks.append(md_block("bulleted_list_item", parse_inline(text)))
+
+        # ── Numbered list ─────────────────────────────────────────────────────
+        elif re.match(r"^\d+\.\s", line):
+            text = re.sub(r"^\d+\.\s+", "", line).strip()
+            if text:
+                blocks.append(md_block("numbered_list_item", parse_inline(text)))
+
+        # ── Table row → bullet ────────────────────────────────────────────────
         elif line.strip().startswith("|") and line.strip().endswith("|"):
-            if re.match(r'^[\|\s\-:]+$', line.strip()):
+            # Skip separator rows like |---|---|
+            if re.match(r"^[\|\s\-:]+$", line.strip()):
                 continue
             cells = [c.strip() for c in line.strip().strip("|").split("|") if c.strip()]
             if cells:
-                blocks.append({"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text":parse_inline(" | ".join(cells))}})
-        elif line.strip():
-            blocks.append({"object":"block","type":"paragraph","paragraph":{"rich_text":parse_inline(line.strip())}})
+                blocks.append(md_block("bulleted_list_item", parse_inline(" | ".join(cells))))
+
+        # ── Skip blank lines ──────────────────────────────────────────────────
+        elif not line.strip():
+            continue
+
+        # ── Paragraph ─────────────────────────────────────────────────────────
+        else:
+            text = line.strip()
+            if text:
+                blocks.append(md_block("paragraph", parse_inline(text)))
+
     return blocks
 
 
