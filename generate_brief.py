@@ -45,6 +45,7 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
     "Notion-Version": "2022-06-28",
 }
+TIMEOUT = httpx.Timeout(60.0, connect=10.0)  # 60s read, 10s connect
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 DAILY_SYSTEM = """你是一名服務於全球宏觀對沖基金的策略分析師，同時具備政治學與政治經濟學的深厚背景。
@@ -334,7 +335,7 @@ def create_notion_page(db_id: str, title: str, report_type: str = "daily") -> st
             "Type": {"select": {"name": report_type.capitalize()}},
         },
     }
-    resp = httpx.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload)
+    resp = httpx.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
     resp.raise_for_status()
     return resp.json()["id"]
 
@@ -346,7 +347,7 @@ def append_blocks(page_id: str, content: str):
             f"https://api.notion.com/v1/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
             json={"children": blocks[i:i+100]}
-        )
+        , timeout=TIMEOUT)
         r.raise_for_status()
 
 
@@ -363,7 +364,7 @@ def _find_or_create_memo_page(title: str) -> str:
     resp = httpx.post(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         headers=NOTION_HEADERS, json=payload
-    )
+    , timeout=TIMEOUT)
     resp.raise_for_status()
     results = resp.json().get("results", [])
     if results:
@@ -377,7 +378,7 @@ def _find_or_create_memo_page(title: str) -> str:
             "Type": {"select": {"name": "Memo"}},
         },
     }
-    r = httpx.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_payload)
+    r = httpx.post("https://api.notion.com/v1/pages", headers=NOTION_HEADERS, json=page_payload, timeout=TIMEOUT)
     r.raise_for_status()
     return r.json()["id"]
 
@@ -388,7 +389,7 @@ def read_memo_page(title: str) -> str:
     resp = httpx.get(
         f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=200",
         headers=NOTION_HEADERS
-    )
+    , timeout=TIMEOUT)
     resp.raise_for_status()
     lines = []
     for block in resp.json().get("results", []):
@@ -407,13 +408,13 @@ def overwrite_memo_page(title: str, content: str):
     resp = httpx.get(
         f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100",
         headers=NOTION_HEADERS
-    )
+    , timeout=TIMEOUT)
     resp.raise_for_status()
     for block in resp.json().get("results", []):
         httpx.delete(
             f"https://api.notion.com/v1/blocks/{block['id']}",
             headers=NOTION_HEADERS
-        )
+        , timeout=TIMEOUT)
     # Write new content
     append_blocks(page_id, content)
 
@@ -431,7 +432,7 @@ def fetch_yesterday_full() -> str:
     resp = httpx.post(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         headers=NOTION_HEADERS, json=payload
-    )
+    , timeout=TIMEOUT)
     resp.raise_for_status()
     results = resp.json().get("results", [])
     if not results:
@@ -439,7 +440,7 @@ def fetch_yesterday_full() -> str:
     br = httpx.get(
         f"https://api.notion.com/v1/blocks/{results[0]['id']}/children?page_size=200",
         headers=NOTION_HEADERS
-    )
+    , timeout=TIMEOUT)
     br.raise_for_status()
     lines = []
     for block in br.json().get("results", []):
@@ -469,7 +470,7 @@ def fetch_last_week_reports() -> list[dict]:
     resp = httpx.post(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         headers=NOTION_HEADERS, json=payload
-    )
+    , timeout=TIMEOUT)
     resp.raise_for_status()
     reports = []
     for page in resp.json().get("results", []):
@@ -477,7 +478,7 @@ def fetch_last_week_reports() -> list[dict]:
         br = httpx.get(
             f"https://api.notion.com/v1/blocks/{page['id']}/children?page_size=200",
             headers=NOTION_HEADERS
-        )
+        , timeout=TIMEOUT)
         br.raise_for_status()
         lines = []
         for block in br.json().get("results", []):
