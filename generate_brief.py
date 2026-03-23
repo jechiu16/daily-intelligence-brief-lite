@@ -249,7 +249,7 @@ def call_claude_with_search(system: str, user: str) -> str:
     while True:
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=8000,
+            max_tokens=16000,
             system=system,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=messages,
@@ -332,9 +332,6 @@ def markdown_to_notion_blocks(md: str) -> list:
                 blocks.append({"object":"block","type":"bulleted_list_item","bulleted_list_item":{"rich_text":parse_inline(" | ".join(cells))}})
         elif line.strip():
             blocks.append({"object":"block","type":"paragraph","paragraph":{"rich_text":parse_inline(line.strip())}})
-        else:
-            # Empty line → add spacing paragraph
-            blocks.append({"object":"block","type":"paragraph","paragraph":{"rich_text":[{"type":"text","text":{"content":""}}]}})
     return blocks
 
 
