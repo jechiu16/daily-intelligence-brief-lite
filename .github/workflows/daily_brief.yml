@@ -13,6 +13,8 @@ jobs:
   generate-brief:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write   # needed for the keep-alive commit
 
     steps:
       - name: Checkout repo
@@ -33,3 +35,12 @@ jobs:
           NOTION_DATABASE_ID:   ${{ secrets.NOTION_DATABASE_ID }}
           NOTION_WEEKLY_DB_ID:  ${{ secrets.NOTION_WEEKLY_DB_ID }}
         run: python generate_brief.py
+
+      - name: Keep repo alive (auto-commit timestamp)
+        run: |
+          echo "Last run: $(date -u '+%Y-%m-%d %H:%M UTC')" > last_run.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_run.txt
+          git commit -m "chore: keep-alive $(date -u '+%Y-%m-%d')" || echo "Nothing to commit"
+          git push
