@@ -122,14 +122,12 @@ ANALYST_SYSTEM = """你是全球宏觀對沖基金的情報分析師兼首席風
 分析規則：
 - 只對 1-2 個 highest-impact 事件走完整 So What 鏈。其餘事件簡要帶過。
 - So What 鏈：事實（數據）→ 經濟機制 → 誰得利/受損 → 風險定價狀態（已定價/部分定價/未定價/過度定價）→ 二階效應 → 資產影響
-- 每個核心判斷後用【挑戰：類型】自我批評，類型必須是以下之一：
-  • time_horizon_mismatch — 短期事件被賦予長期意義，或反之
-  • causal_misattribution — 把相關性當因果，或歸因錯誤
-  • base_rate_neglect — 忽略了歷史基準率
-  • policy_reaction_function_error — 誤判政策制定者的反應函數
-  • reflexivity_risk — 忽略市場預期本身改變結果的可能
-  • second_order_effect_ignored — 只看一階效應
-  • positioning_crowding_risk — 忽略倉位擁擠的反向風險
+- 每個核心判斷後執行四種結構化攻擊，標記為【攻擊結果】：
+  1. regime_misclassification — 若 regime 判斷錯誤，最可能的替代解讀是哪一種？
+  2. timing_error — 方向正確但時機錯誤的條件是什麼？需要什麼才能讓 thesis 成立？
+  3. reflexivity_break — 市場倉位是否已定價此 thesis？共識是否已強到讓 thesis 失效？
+  4. second_order_inversion — 在什麼條件下因果鏈會反轉？（例：油價上漲通常通膨，但若需求崩潰則反轉為通縮）
+  攻擊後修正 thesis：若攻擊改變了判斷，標注修正後的版本。
 - 記錄反向訊號
 
 Knowledge Desk 規則：
@@ -343,9 +341,10 @@ L3：JSON 陣列，每個 thesis 格式：{{"name":"...","statement":"...","date
 - 加入 NEW_THESIS 標記的項目
 - 將 INVALIDATE_THESIS 標記的項目 status 改為 "invalidated"
 - 刪除 >30天且 status=invalidated 的項目
-L4：JSON 陣列，每條 {{"date":"...","bias_type":"...","description":"..."}}
-- bias_type 必須是：time_horizon_mismatch / causal_misattribution / base_rate_neglect / policy_reaction_function_error / reflexivity_risk / second_order_effect_ignored / positioning_crowding_risk
-- 加入今日最重要的 1 條偏誤記錄，刪除 >14天的項目"""
+L4：JSON 陣列，每條 {{"date":"...","attack_type":"...","description":"...","thesis_revised":true/false}}
+- attack_type 必須是：regime_misclassification / timing_error / reflexivity_break / second_order_inversion
+- 加入今日最重要的 1 條攻擊記錄，標注是否導致 thesis 修正
+- 刪除 >14天的項目"""
 
 # ── Weekly Review (Sonnet) ────────────────────────────────────────────────────
 WEEKLY_SYSTEM = """你是宏觀對沖基金資深策略師，負責週度總結。
