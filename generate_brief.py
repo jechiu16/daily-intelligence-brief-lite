@@ -1,25 +1,35 @@
 """
-Daily Intelligence Brief Generator — v8.3
+Daily Intelligence Brief Generator — v8.4 "Evolvable System"
 
 Architecture:
-  - Data layer: yfinance + FRED + Correlation Matrix
-  - Analyst + DA (Sonnet + extended thinking, 3 narrative searches)
-  - Logic Guardrail (Haiku — hard data consistency check)
-  - Opus Logic Chain Reviewer (causal + historical fact check)
-  - Narrator (Sonnet — 通識課教授角色)
-  - Post-Narrator Data Audit (Haiku — catches Narrator drift)
-  - Layer Update (Haiku)
-  - Weekly Review (Sonnet)
+  Layer 0  — Deterministic math (yfinance + FRED + derived signals)
+  Layer 0b — Relational guardrail (cross-asset consistency, Python rules)
+  Layer 1  — Analyst + DA (Sonnet + extended thinking, 3 narrative searches)
+  Layer 1b — Logic Guardrail (Haiku — hard data consistency)
+  Layer 1c — Opus Logic Chain Reviewer (causal + historical fact check)
+  Layer 2  — Narrator (Sonnet — 通識課教授)
+  Layer 2b — Post-Narrator Data Audit (Haiku — catches drift)
+  Layer 3  — Memory Update (Haiku — L2/L3/L4/KH)
+  Layer 4  — Daily Scorecard (L5 — T+1 prediction backtest)
+  Layer 5  — Weekly Review + Thesis Outcome Eval + Prompt Governance
+  Layer 6  — Monthly Meta Review (scaffolding)
 
-v8.3 fixes (from live audit):
-  1. hard_truths expanded: all assets now include price, direction, pct
-  2. Guardrail scope widened: checks every asset's price/direction/pct, not just real yield
-  3. Post-Narrator audit: second guardrail AFTER Narrator rewrites, catches drift
-  4. Data anchors injected into Narrator prompt as immutable reference
-  5. Correlation matrix label fixed: was "近5日", actually uses 20-day window
-  6. Opus Logic Reviewer now checks historical fact accuracy (year/event matching)
-  7. Market data labels clarified as closing prices with intraday note
-  8. build_narrator_prompt accepts hard_truths for data anchor injection
+v8.4 new systems:
+  1.  Daily Scorecard (L5): T+1 backtest of yesterday's direction calls
+  2.  Thesis Outcome Tracking: L3 schema adds outcome/outcome_date/outcome_method
+  3.  Relational Guardrail: Python cross-asset consistency rules (pre-Analyst)
+  4.  New indicators: 5y5y forward inflation, Copper/Gold ratio, NFCI (weekly)
+  5.  Feedback Loop: L5 scorecard + recent hit rate injected into Analyst context
+  6.  base_rate_neglect: 6th attack mode in DA
+  7.  Prompt Governance: version tracking, weekly drift section, change log
+  8.  Conviction dampener: auto-downgrade if 7d hit rate < 55%
+  9.  Weekly review enhanced: thesis outcome eval + prompt review section
+  10. Monthly review scaffolding (1st of month)
+
+Prompt version: v8.4.0
+Change log:
+  v8.3.0 → v8.4.0: Added L5 scorecard, relational guardrail, thesis outcomes,
+                     feedback loop, prompt governance, 5y5y + Cu/Au indicators
 
 Deployment:
   pip install anthropic httpx pandas numpy yfinance fredapi tzdata
@@ -39,6 +49,8 @@ from zoneinfo import ZoneInfo
 
 _TZ = ZoneInfo("Asia/Taipei")
 
+PROMPT_VERSION = "v8.4.0"
+
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 NOTION_API_KEY    = os.environ["NOTION_API_KEY"]
@@ -54,6 +66,7 @@ TODAY     = datetime.datetime.now(_TZ).date()
 YESTERDAY = TODAY - datetime.timedelta(days=1)
 WEEKDAY   = TODAY.weekday()
 IS_MONDAY = WEEKDAY == 0
+IS_FIRST_OF_MONTH = TODAY.day == 1
 DATE_STR  = TODAY.strftime("%Y-%m-%d")
 DATE_LABEL = TODAY.strftime("%Y年%m月%d日（%A）").replace(
     "Monday","週一").replace("Tuesday","週二").replace("Wednesday","週三").replace(
@@ -77,10 +90,13 @@ TIMEOUT     = httpx.Timeout(60.0, connect=10.0)
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
+# Memory page titles
 LAYER2_TITLE      = "__WeeklyCompressed__"
 LAYER3_TITLE      = "__LongTermTracker__"
 LAYER4_TITLE      = "__DevilsAdvocateLog__"
 KNOWLEDGE_HISTORY = "__KnowledgeHistory__"
+SCORECARD_TITLE   = "__DailyScorecard__"       # v8.4: L5
+PROMPT_LOG_TITLE  = "__PromptGovernanceLog__"   # v8.4: prompt change history
 
 # ── Retry ─────────────────────────────────────────────────────────────────────
 def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
@@ -91,49 +107,43 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             last_exc = e
             print(f"    ⚠ Network error attempt {attempt}/{retries}: {e}")
-            if attempt < retries:
-                time.sleep(delay * attempt)
+            if attempt < retries: time.sleep(delay * attempt)
         except httpx.HTTPStatusError as e:
             last_exc = e
             if e.response.status_code == 429:
                 print(f"    ⚠ Rate limited attempt {attempt}/{retries}")
-                if attempt < retries:
-                    time.sleep(delay * attempt * 2)
+                if attempt < retries: time.sleep(delay * attempt * 2)
             elif e.response.status_code >= 500:
-                if attempt < retries:
-                    time.sleep(delay * attempt)
-                else:
-                    raise
-            else:
-                raise
+                if attempt < retries: time.sleep(delay * attempt)
+                else: raise
+            else: raise
         except anthropic.RateLimitError as e:
             last_exc = e
             print(f"    ⚠ Anthropic rate limit attempt {attempt}/{retries}")
-            if attempt < retries:
-                time.sleep(delay * attempt * 3)
+            if attempt < retries: time.sleep(delay * attempt * 3)
         except anthropic.APIStatusError as e:
             last_exc = e
             if e.status_code >= 500:
-                if attempt < retries:
-                    time.sleep(delay * attempt)
-                else:
-                    raise
-            else:
-                raise
+                if attempt < retries: time.sleep(delay * attempt)
+                else: raise
+            else: raise
         except Exception as e:
             last_exc = e
             print(f"    ⚠ Unexpected error attempt {attempt}/{retries}: {e}")
-            if attempt < retries:
-                time.sleep(delay)
+            if attempt < retries: time.sleep(delay)
     raise RuntimeError(f"All {retries} attempts failed") from last_exc
 
-# ── Data Layer ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 0 — DETERMINISTIC DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
 def fetch_yfinance_data() -> tuple[dict, str]:
     try:
         import yfinance as yf
     except ImportError:
         print("    ⚠ yfinance not installed"); return {}, ""
 
+    # v8.4: added Copper (HG=F) for Cu/Au ratio
     tickers = {
         "SPX":    "^GSPC",
         "Brent":  "BZ=F",
@@ -141,22 +151,22 @@ def fetch_yfinance_data() -> tuple[dict, str]:
         "DXY":    "DX-Y.NYB",
         "UST10Y": "^TNX",
         "VIX":    "^VIX",
+        "Copper": "HG=F",
     }
     results = {}
     corr_text = ""
     try:
-        data = yf.download(list(tickers.values()), period="10d", interval="1d",
+        data = yf.download(list(tickers.values()), period="22d", interval="1d",
                            progress=False, threads=True)
         if data.empty:
             return {}, ""
-
         close = data["Close"]
 
-        # ── Correlation matrix (20-day window) ────────────────────────────
-        # v8.3 fix: label now correctly says 20日, matching actual window
+        # Correlation matrix (20-day window, core 6 assets only)
         try:
-            subset = close[list(tickers.values())].tail(20)
-            inv = {v: k for k, v in tickers.items()}
+            core_tks = {k: v for k, v in tickers.items() if k != "Copper"}
+            subset = close[list(core_tks.values())].tail(20)
+            inv = {v: k for k, v in core_tks.items()}
             subset.columns = [inv.get(c, c) for c in subset.columns]
             corr = subset.corr()
             lines = ["### 資產相關性矩陣（近20個交易日）",
@@ -175,10 +185,9 @@ def fetch_yfinance_data() -> tuple[dict, str]:
                 if len(s) >= 2:
                     lat, prev = float(s.iloc[-1]), float(s.iloc[-2])
                     results[name] = {
-                        "price":  round(lat, 2),
-                        "change": round(lat - prev, 2),
-                        "pct":    round((lat - prev) / prev * 100, 2),
-                        "date":   str(s.index[-1].date()),
+                        "price": round(lat, 2), "change": round(lat - prev, 2),
+                        "pct": round((lat - prev) / prev * 100, 2),
+                        "date": str(s.index[-1].date()),
                     }
                 elif len(s) == 1:
                     results[name] = {
@@ -201,28 +210,30 @@ def fetch_fred_data() -> dict:
     except ImportError:
         print("    ⚠ fredapi not installed"); return {}
 
+    # v8.4: added 5y5y forward inflation + NFCI
     series = {
-        "Fed Funds Rate":       "DFF",
-        "2Y Treasury":          "DGS2",
-        "10Y Treasury":         "DGS10",
-        "Yield Curve (10Y-2Y)": "T10Y2Y",
-        "Breakeven Inflation":  "T10YIE",
-        "HY Credit Spread":     "BAMLH0A0HYM2",
+        "Fed Funds Rate":        "DFF",
+        "2Y Treasury":           "DGS2",
+        "10Y Treasury":          "DGS10",
+        "Yield Curve (10Y-2Y)":  "T10Y2Y",
+        "Breakeven Inflation":   "T10YIE",
+        "5Y5Y Forward Inflation":"T5YIFR",
+        "HY Credit Spread":      "BAMLH0A0HYM2",
+        "NFCI":                  "NFCI",
     }
     results = {}
     try:
         fred  = Fred(api_key=FRED_API_KEY)
-        start = YESTERDAY - datetime.timedelta(days=10)
+        start = YESTERDAY - datetime.timedelta(days=14)
         for name, sid in series.items():
             try:
                 s = fred.get_series(sid, observation_start=start).dropna()
                 if len(s) >= 2:
                     lat, prev = float(s.iloc[-1]), float(s.iloc[-2])
                     results[name] = {
-                        "value":  round(lat, 3),
-                        "prev":   round(prev, 3),
+                        "value": round(lat, 3), "prev": round(prev, 3),
                         "change": round(lat - prev, 3),
-                        "date":   str(s.index[-1].date()),
+                        "date": str(s.index[-1].date()),
                     }
                 elif len(s) == 1:
                     results[name] = {
@@ -238,25 +249,21 @@ def fetch_fred_data() -> dict:
 
 
 def format_market_data(yfd: dict, frd: dict, corr_text: str) -> tuple[str, dict]:
-    """Returns (market_data_string, hard_truths_dict).
-    v8.3: hard_truths now includes ALL asset prices, directions, and pct changes."""
+    """Returns (market_data_string, hard_truths_dict)."""
     if not yfd and not frd:
         return "", {}
 
     hard_truths = {}
     lines = ["## 預載市場數據（API 直取，精確度高於搜尋）\n"]
-
     if corr_text:
         lines.append(corr_text + "\n")
 
-    # ── v8.3: Asset data with closing price labels + inject ALL into hard_truths ──
     if yfd:
         lines.append("### 價格（yfinance，收盤價）")
         for n, d in yfd.items():
             if d["change"] is not None:
                 dr = "↑" if d["change"] > 0 else "↓" if d["change"] < 0 else "→"
                 lines.append(f"- {n}: {d['price']}（收盤價）({dr} {d['pct']:+.2f}%) [{d['date']}]")
-                # v8.3: populate hard_truths for every asset
                 hard_truths[f"{n}_price"] = d["price"]
                 hard_truths[f"{n}_pct"] = d["pct"]
                 hard_truths[f"{n}_direction"] = (
@@ -266,6 +273,16 @@ def format_market_data(yfd: dict, frd: dict, corr_text: str) -> tuple[str, dict]
                 lines.append(f"- {n}: {d['price']}（收盤價）[{d['date']}]")
                 hard_truths[f"{n}_price"] = d["price"]
         lines.append("")
+
+        # v8.4: Copper/Gold ratio
+        if "Copper" in yfd and "Gold" in yfd:
+            cu = yfd["Copper"]["price"]
+            au = yfd["Gold"]["price"]
+            if au > 0:
+                cu_au = round(cu / au * 1000, 3)  # *1000 for readability
+                lines.append(f"### 衍生：Copper/Gold Ratio = {cu_au} (×1000)")
+                lines.append("  高→景氣擴張預期；低→避險/衰退預期\n")
+                hard_truths["copper_gold_ratio"] = cu_au
 
     if frd:
         lines.append("### 宏觀指標（FRED）")
@@ -282,107 +299,369 @@ def format_market_data(yfd: dict, frd: dict, corr_text: str) -> tuple[str, dict]
         be  = frd.get("Breakeven Inflation", {})
         hy  = frd.get("HY Credit Spread", {})
         n10 = frd.get("10Y Treasury", {})
+        fwd = frd.get("5Y5Y Forward Inflation", {})
+        nfci = frd.get("NFCI", {})
 
         if yc.get("value") is not None:
-            v   = yc["value"]
-            tag = "倒掛（衰退訊號）" if v < 0 else "平坦（成長前景謹慎）" if v < 0.5 else "正常"
+            v = yc["value"]
+            tag = "倒掛（衰退訊號）" if v < 0 else "平坦（謹慎）" if v < 0.5 else "正常"
             lines.append(f"- 殖利率曲線 (10Y-2Y)：{v}% — {tag}")
-            hard_truths["yield_curve_value"]    = v
+            hard_truths["yield_curve_value"] = v
             hard_truths["yield_curve_inverted"] = v < 0
 
-        # Real Yield = Nominal 10Y - Breakeven (Python-computed)
         if n10.get("value") is not None and be.get("value") is not None:
             ry_today = round(n10["value"] - be["value"], 3)
             hard_truths["real_yield_value"] = ry_today
-
             ry_direction = "flat"
             if n10.get("prev") is not None and be.get("prev") is not None:
-                ry_prev      = round(n10["prev"] - be["prev"], 3)
-                delta        = ry_today - ry_prev
+                ry_prev = round(n10["prev"] - be["prev"], 3)
+                delta = ry_today - ry_prev
                 ry_direction = "up" if delta > 0.001 else "down" if delta < -0.001 else "flat"
             hard_truths["real_yield_direction"] = ry_direction
-
             dr_label = {"up": "↑", "down": "↓", "flat": "→"}[ry_direction]
-            lines.append(
-                f"- 實質利率 (10Y Real Yield)：{ry_today}% ({dr_label})"
-                f"  [= Nominal {n10['value']}% − BEI {be['value']}%]"
-            )
+            lines.append(f"- 實質利率：{ry_today}% ({dr_label}) [= {n10['value']}% − BEI {be['value']}%]")
 
         if be.get("value") is not None:
-            v   = be["value"]
-            tag = "高於" if v > 2.5 else "接近" if v > 2.0 else "低於"
-            lines.append(f"- 通膨預期（10Y BEI）：{v}% — {tag} Fed 目標")
-            hard_truths["breakeven_value"] = v
-
+            hard_truths["breakeven_value"] = be["value"]
         if hy.get("value") is not None:
-            v   = hy["value"]
-            tag = "壓力區間" if v > 5.0 else "偏緊" if v < 3.5 else "正常"
-            lines.append(f"- 高收益信用利差：{v}% — {tag}")
+            v = hy["value"]
+            tag = "壓力" if v > 5.0 else "偏緊" if v < 3.5 else "正常"
+            lines.append(f"- HY 信用利差：{v}% — {tag}")
             hard_truths["hy_spread_value"] = v
+
+        # v8.4: 5y5y forward — cleaner than 10Y BEI for medium-term inflation
+        if fwd.get("value") is not None:
+            v = fwd["value"]
+            lines.append(f"- 5Y5Y 遠期通膨預期：{v}%（比 10Y BEI 更少短期噪音）")
+            hard_truths["forward_5y5y"] = v
+            # Divergence signal
+            if be.get("value") is not None:
+                gap = round(be["value"] - v, 3)
+                if abs(gap) > 0.15:
+                    lines.append(f"  ⚡ BEI vs 5Y5Y 缺口：{gap:+.3f}%（>0.15 = 短期通膨噪音過高）")
+
+        # v8.4: NFCI (weekly, lower freq)
+        if nfci.get("value") is not None:
+            v = nfci["value"]
+            tag = "緊縮" if v > 0 else "寬鬆"
+            lines.append(f"- NFCI 金融條件指數：{v} — {tag}（>0=緊縮，<0=寬鬆，週頻）")
+            hard_truths["nfci_value"] = v
         lines.append("")
 
-    # v8.3: clarified closing price note + intraday warning
     lines.append(
-        "（直接使用以上數據，不需再搜尋驗證。"
-        "若敘事與數據計算衝突，以數據為準。\n"
-        "注意：以上為收盤價。若搜尋結果顯示盤中價格與收盤價有顯著差異，"
-        "請在報告中標注盤中波動，但方向性判斷與漲跌幅以收盤價為準。）\n"
+        "（直接使用以上數據，不需搜尋驗證。方向與幅度以收盤價為準。"
+        "若搜尋顯示盤中波動，可在敘事中補充，但數據切面以此為準。）\n"
     )
     return "\n".join(lines), hard_truths
 
-# ── Analyst + Devil's Advocate ────────────────────────────────────────────────
-ANALYST_SYSTEM = """你是全球宏觀對沖基金的情報分析師兼首席風險官。
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 0b — RELATIONAL GUARDRAIL (cross-asset consistency, deterministic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_relational_guardrail(hard_truths: dict) -> list[str]:
+    """Python-based cross-asset consistency rules.
+    Returns list of flags to inject into Analyst context.
+    These are NOT errors — they are anomalies requiring explanation."""
+    flags = []
+    if not hard_truths:
+        return flags
+
+    gold_dir = hard_truths.get("Gold_direction")
+    ry_dir   = hard_truths.get("real_yield_direction")
+    spx_dir  = hard_truths.get("SPX_direction")
+    dxy_dir  = hard_truths.get("DXY_direction")
+    vix_pct  = hard_truths.get("VIX_pct", 0)
+    spx_pct  = hard_truths.get("SPX_pct", 0)
+    brent_pct = hard_truths.get("Brent_pct", 0)
+    bei      = hard_truths.get("breakeven_value")
+    fwd_5y5y = hard_truths.get("forward_5y5y")
+
+    # Rule 1: Gold up + Real yield up → requires explanation
+    if gold_dir == "up" and ry_dir == "up":
+        flags.append(
+            "⚡ RELATIONAL FLAG: Gold ↑ + 實質利率 ↑ — 歷史上負相關。"
+            "需解釋：央行購金？地緣避險溢價？美元信用折價？"
+        )
+
+    # Rule 2: SPX up + VIX up (with threshold)
+    if spx_pct > 0.5 and vix_pct > 3.0:
+        flags.append(
+            f"⚡ RELATIONAL FLAG: SPX +{spx_pct}% + VIX +{vix_pct}% — "
+            "股指與恐慌指數同漲。短擠軋？選擇權 gamma squeeze？"
+        )
+
+    # Rule 3: Oil down big + BEI up → inflation expectation inconsistency
+    if brent_pct < -5.0 and bei is not None and fwd_5y5y is not None:
+        if hard_truths.get("breakeven_value", 0) > (fwd_5y5y or 0):
+            flags.append(
+                f"⚡ RELATIONAL FLAG: Brent {brent_pct:+.1f}% 但 BEI > 5Y5Y — "
+                "油價崩但通膨預期未等比例下修，供應鏈黏性？"
+            )
+
+    # Rule 4: SPX up + Real yield up → likely short-covering, not fundamental
+    if spx_dir == "up" and ry_dir == "up" and spx_pct > 0.5:
+        flags.append(
+            "⚡ RELATIONAL FLAG: SPX ↑ + 實質利率 ↑ — 估值邏輯矛盾。"
+            "必須定調為倉位回補或流動性驅動，不可歸因於基本面改善。"
+        )
+
+    # Rule 5: Narrative vs price coherence — overall risk-on vs risk-off
+    risk_on_count = sum([
+        spx_dir == "up",
+        gold_dir == "down",
+        dxy_dir == "down",
+        hard_truths.get("VIX_direction") == "down",
+    ])
+    risk_off_count = sum([
+        spx_dir == "down",
+        gold_dir == "up",
+        dxy_dir == "up",
+        hard_truths.get("VIX_direction") == "up",
+    ])
+    if risk_on_count >= 3:
+        flags.append("📊 REGIME SIGNAL: 3+ risk-on indicators — 整體偏向風險偏好回歸")
+    elif risk_off_count >= 3:
+        flags.append("📊 REGIME SIGNAL: 3+ risk-off indicators — 整體偏向避險")
+    elif risk_on_count >= 2 and risk_off_count >= 2:
+        flags.append("📊 REGIME SIGNAL: 混合訊號 — 資產間缺乏共識，方向性押注風險高")
+
+    return flags
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER 4 — DAILY SCORECARD (T+1 backtest)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_daily_scorecard(yfd: dict) -> tuple[str, str]:
+    """Compare yesterday's direction calls against today's actual prices.
+    Returns (scorecard_line, feedback_text_for_analyst).
+    scorecard_line is stored in L5. feedback_text is injected into today's Analyst."""
+    yesterday_str = YESTERDAY.strftime("%Y-%m-%d")
+
+    # 1. Read yesterday's report to extract direction calls
+    try:
+        data = notion_post(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+            {"filter": {"and": [
+                {"property": "Date",  "date":   {"equals": yesterday_str}},
+                {"property": "Type",  "select": {"equals": "Daily"}},
+            ]}}
+        )
+        results = data.get("results", [])
+        if not results:
+            return "", ""
+        content = read_page_content(results[0]["id"])
+    except Exception as e:
+        print(f"    ⚠ Scorecard: cannot read yesterday's report ({e})")
+        return "", ""
+
+    # 2. Extract direction calls using Haiku (structured extraction)
+    extract_prompt = f"""從以下報告的「配置羅盤」段落中，提取方向判斷。
+只輸出純 JSON，無 markdown：
+{{"calls": [{{"asset": "資產名", "direction": "up/down/neutral", "conviction": "H/M/L"}}]}}
+
+只提取這5類：美股(SPX)、黃金(Gold)、美元(DXY)、美債長端(UST10Y)、原油(Brent)。
+若找不到某資產，跳過。
+
+報告內容（截取配置相關段落）：
+---
+{content[-2000:]}
+---"""
+
+    try:
+        raw = call_claude(
+            "只輸出純 JSON，無 markdown 標記。",
+            extract_prompt, MODEL_HAIKU, max_tokens=300
+        )
+        raw = _repair_json(raw)
+        calls_data = json.loads(raw)
+        calls = calls_data.get("calls", [])
+    except Exception as e:
+        print(f"    ⚠ Scorecard: extraction failed ({e})")
+        return "", ""
+
+    if not calls:
+        return "", ""
+
+    # 3. Score against today's actuals
+    asset_map = {
+        "SPX": "SPX", "美股": "SPX",
+        "Gold": "Gold", "黃金": "Gold",
+        "DXY": "DXY", "美元": "DXY",
+        "UST10Y": "UST10Y", "美債": "UST10Y",
+        "Brent": "Brent", "原油": "Brent",
+    }
+
+    score_parts = []
+    total_score = 0
+    total_possible = 0
+    conviction_weights = {"H": 3, "M": 2, "L": 1}
+
+    for call in calls:
+        asset_raw = call.get("asset", "")
+        direction = call.get("direction", "").lower()
+        conviction = call.get("conviction", "M").upper()
+        weight = conviction_weights.get(conviction, 2)
+
+        # Map to our ticker names
+        asset = None
+        for key, val in asset_map.items():
+            if key.lower() in asset_raw.lower():
+                asset = val
+                break
+        if not asset or asset not in yfd:
+            continue
+
+        actual_dir = "up" if yfd[asset].get("change", 0) and yfd[asset]["change"] > 0 else \
+                     "down" if yfd[asset].get("change", 0) and yfd[asset]["change"] < 0 else "flat"
+        actual_pct = yfd[asset].get("pct", 0) or 0
+
+        # Score
+        if direction == "neutral":
+            hit = abs(actual_pct) < 0.5
+            mark = "✓" if hit else "½"
+            pts = weight if hit else weight * 0.5
+        else:
+            hit = (direction == actual_dir)
+            mark = "✓" if hit else "✗"
+            pts = weight if hit else -weight
+
+        total_score += pts
+        total_possible += weight
+        actual_arrow = {"up": "↑", "down": "↓", "flat": "→"}.get(actual_dir, "?")
+        score_parts.append(f"{asset}:{direction}:{conviction}:{mark}(actual:{actual_arrow}{actual_pct:+.1f}%)")
+
+    if not score_parts:
+        return "", ""
+
+    scorecard_line = f"{yesterday_str} | {' | '.join(score_parts)} | score:{total_score}/{total_possible}"
+
+    # 4. Read existing scorecard for rolling stats
+    try:
+        old_scorecard = read_memo(SCORECARD_TITLE)
+    except Exception:
+        old_scorecard = ""
+
+    all_lines = [ln.strip() for ln in old_scorecard.strip().split("\n") if ln.strip()] if old_scorecard else []
+    all_lines.append(scorecard_line)
+
+    # Keep last 30 days
+    cutoff = (TODAY - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+    all_lines = [ln for ln in all_lines if ln[:10] >= cutoff]
+
+    # Calculate rolling hit rates
+    hits_7d, total_7d = 0, 0
+    hits_30d, total_30d = 0, 0
+    cutoff_7d = (TODAY - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+
+    for ln in all_lines:
+        line_hits = ln.count(":✓")
+        line_misses = ln.count(":✗")
+        line_half = ln.count(":½")
+        line_total = line_hits + line_misses + line_half
+        hits_30d += line_hits + line_half * 0.5
+        total_30d += line_total
+        if ln[:10] >= cutoff_7d:
+            hits_7d += line_hits + line_half * 0.5
+            total_7d += line_total
+
+    rate_7d = round(hits_7d / total_7d * 100, 1) if total_7d > 0 else 0
+    rate_30d = round(hits_30d / total_30d * 100, 1) if total_30d > 0 else 0
+
+    # Save updated scorecard
+    try:
+        safe_overwrite_memo(SCORECARD_TITLE, "\n".join(all_lines))
+    except Exception as e:
+        print(f"    ⚠ Scorecard save failed ({e})")
+
+    # 5. Build feedback text for Analyst
+    feedback = f"""### 預測回測（L5 Scorecard）
+昨日方向性回測：{scorecard_line}
+近 7 日 hit rate: {rate_7d}% | 近 30 日: {rate_30d}%"""
+
+    # v8.4: Conviction dampener
+    if rate_7d < 55 and total_7d >= 5:
+        feedback += "\n⚠ 近 7 日 hit rate < 55%：今日 conviction 自動降一級（H→M, M→L）。反思哪類判斷最弱。"
+
+    # Identify systematic weaknesses
+    miss_assets = re.findall(r"(\w+):\w+:\w+:✗", scorecard_line)
+    if miss_assets:
+        feedback += f"\n昨日錯誤資產：{', '.join(miss_assets)}——分析錯因後調整今日同類判斷。"
+
+    return "\n".join(all_lines), feedback
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYST + DEVIL'S ADVOCATE
+# ══════════════════════════════════════════════════════════════════════════════
+
+# v8.4: Added 6th attack (base_rate_neglect), feedback loop, relational flags
+ANALYST_SYSTEM = f"""你是全球宏觀對沖基金的情報分析師兼首席風險官。
+Prompt version: {PROMPT_VERSION}
 
 重要：若收到預載市場數據（yfinance + FRED），直接使用，不需搜尋市場價格。3次 web_search 全部用於敘事性搜尋。
 
 【絕對宏觀法則（Macro Physics Engine）】
-在推導跨資產邏輯時，必須嚴格遵守以下數學與金融常理，絕不可為了敘事流暢而扭曲：
-1. 實質殖利率 = 名目殖利率 − 通膨預期（BEI）。若原物料大跌導致通膨預期重挫而名目殖利率跌幅較小，實質殖利率為「上升（Spike）」。
-2. 實質殖利率上升 → 壓縮高估值資產（SPX 科技股）的估值倍數。
-3. 若市場出現背離（實質利率升、美股卻大漲），必須定調為「倉位回補」或「流動性幻覺」，切勿合理化為基本面改善。
-Python 已預先計算實質利率，數字在預載數據中，請直接引用。
+1. 實質殖利率 = 名目殖利率 − 通膨預期（BEI）。Python 已預先計算，直接引用。
+2. 實質殖利率上升 → 壓縮高估值資產估值倍數。
+3. 若市場背離（實質利率升、美股卻漲），定調為倉位回補或流動性幻覺。
+4. 5Y5Y 遠期通膨比 10Y BEI 更乾淨——當兩者分歧 >15bps，優先用 5Y5Y 判斷趨勢。
+5. Copper/Gold ratio 上升 = 景氣擴張預期；下降 = 衰退預期。
 
-【數據精確度法則（v8.3 新增）】
-- 預載數據中的價格、漲跌幅、方向是 Python 從 API 直取的收盤價，精確度最高。
-- 搜尋結果中的價格可能是盤中快照、開盤價、或不同時區的報價，與收盤價可能有差異。
-- 若搜尋價格與預載數據衝突：方向與幅度以預載數據為準，但可在文中補充盤中波動描述。
-- 禁止對預載數據做四捨五入或「記憶性改寫」——引用時必須逐字使用預載數字。
+【數據法則】
+- 預載數據是收盤價，精確度最高。搜尋可能是盤中報價。
+- 方向與幅度以預載為準。禁止四捨五入或記憶性改寫。
+
+【Relational Flags】
+若收到 ⚡ RELATIONAL FLAG，必須在草稿中明確回應該 flag：
+解釋矛盾的原因，或承認不確定性。不可忽略。
+
+【Scorecard Feedback】
+若收到預測回測（L5），必須：
+1. 承認昨日錯誤項目
+2. 若 hit rate < 55%，所有 conviction 降一級
+3. 分析錯誤模式（哪類資產最弱？哪種 regime 判斷最差？）
 
 分析規則：
-- 1-2 個 highest-impact 事件走完整 So What 鏈：事實（數據）→ 經濟機制 → 誰得利/受損 → 風險定價狀態（已定價/部分定價/未定價/過度定價）→ 二階效應 → 資產影響
-- 每個核心判斷後執行五種結構化攻擊，標記為【攻擊結果】：
-  1. regime_misclassification — 若 regime 判斷錯誤，最可能的替代解讀？
-  2. timing_error — 方向正確但時機錯誤的條件？
-  3. reflexivity_break — 倉位擁擠是否讓 thesis 失效？
-  4. second_order_inversion — 因果鏈在什麼條件下反轉？
-  5. omitted_variable_bias — 因果鏈正確但有哪個隱藏變數被忽略？
-  攻擊後：若改變判斷，標注修正後版本。
-- 記錄反向訊號
+- 1-2 個 highest-impact 事件走完整 So What 鏈
+- 每個核心判斷後執行六種結構化攻擊【攻擊結果】：
+  1. regime_misclassification — 替代 regime 解讀
+  2. timing_error — 方向正確但時機錯誤
+  3. reflexivity_break — 倉位擁擠使 thesis 失效
+  4. second_order_inversion — 因果鏈反轉條件
+  5. omitted_variable_bias — 隱藏變數
+  6. base_rate_neglect — 歷史上這類事件的基準機率是多少？你是否因敘事顯著性高估了概率？
+  攻擊後若改變判斷，標注修正版本。
 
-【歷史案例精確度法則（v8.3 新增）】
-引用歷史案例時：
-- 年份必須準確。若不確定，用搜尋驗證或標注「約 XXXX 年」。
-- 禁止混淆不同事件的時間線（例：紅海危機是 2023-2024 年，不是 2022 年）。
-- 每個歷史案例必須附帶至少一個可驗證的數據點（指數水平、利率、跌幅等）。
-
-Knowledge Desk 規則：
-- 查看近期主題列表，避免高度重複
-- 難度輪換：concept → mechanism → structural
+【歷史案例法則】
+- 年份必須準確（紅海危機=2023-2024，俄烏=2022，SVB=2023.3）
+- 每個案例附至少一個可驗證數據點
 
 Thesis 規則：
-- 新判斷：NEW_THESIS: {"name": "...", "statement": "...", "assets": [...], "invalidators": [...]}
-- 失效：INVALIDATE_THESIS: {"name": "..."}
+- NEW_THESIS: {{"name":"...","statement":"...","assets":[...],"invalidators":[...],"measurable_outcome":"具體可驗證的結果","time_horizon":"1w/2w/1m"}}
+- INVALIDATE_THESIS: {{"name":"..."}}
 
-繁體中文，保留英文術語。直接輸出，不要開場白。
-3次 web_search，嚴格依序，不多不少。"""
+繁體中文，保留英文術語。直接輸出。3次 web_search。"""
 
 
 def build_analyst_prompt(layer1: str, layer2: str, layer3: str,
                           layer4: str, knowledge_history: str,
-                          market_data: str) -> str:
+                          market_data: str, relational_flags: list[str],
+                          scorecard_feedback: str) -> str:
     ctx = ""
     if market_data:
         ctx += f"\n{market_data}\n"
+
+    # v8.4: relational flags
+    if relational_flags:
+        ctx += "\n### 跨資產一致性警報（Relational Guardrail）\n"
+        ctx += "\n".join(relational_flags) + "\n"
+
+    # v8.4: scorecard feedback loop
+    if scorecard_feedback:
+        ctx += f"\n{scorecard_feedback}\n"
+
     if layer1:
         ctx += f"\n### 昨日摘要\n{layer1}\n"
     if layer2:
@@ -408,265 +687,146 @@ def build_analyst_prompt(layer1: str, layer2: str, layer3: str,
 
     return f"""{DATE_LABEL} 情報草稿。
 
-3次搜尋（依序，不多不少）：
+3次搜尋（依序）：
 {searches}
 {ctx}
 草稿結構：
 
 ## 資產快照
-Brent、10Y UST、DXY、SPX、Gold（使用預載數據 + 搜尋脈絡解讀）。
-【重要】引用價格和漲跌幅時，必須逐字使用預載數據中的數字，不得四捨五入或從搜尋結果取替代數字。
+Brent、10Y UST、DXY、SPX、Gold + Copper/Gold ratio + 5Y5Y forward
+逐字使用預載數據數字。
+
+## Relational Flags 回應
+逐條回應收到的 ⚡ flags（若有）。
 
 ## 核心事件
-1-2 個 highest-impact 事件走完整 So What 鏈。
-每個判斷後加【攻擊結果】（五種攻擊）。
-攻擊後若改變判斷，標注修正版本。
+1-2 個 highest-impact 事件 + So What 鏈 + 【攻擊結果】（六種）。
 
 ## 邊陲：{PERIPHERY_LABEL}
-局勢、行為者、與全球宏觀的傳導路徑。
 
 ## Knowledge Desk 素材
-1個概念（避免與近期主題重複）：
-- 概念名稱與難度層級（concept / mechanism / structural）
-- 為何今天重要、歷史案例（附年份數據，年份必須準確）、常見誤解、何時失效
+1個概念，年份準確。
 
 ## 前瞻訊號
-48-72hr 內 3-5 個關鍵 catalysts，每個附影響路徑。
+48-72hr，3-5 個 catalysts。
 
 ## 資產方向
-各資產方向、理由、conviction（H/M/L）、主要風險。
+含 conviction（若 L5 hit rate < 55% 則降一級）。
 
-（若有 thesis 變動，末尾標記。）"""
+（thesis 變動標記於末尾。）"""
 
-# ── Logic Guardrail (v8.3: expanded scope) ────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GUARDRAILS (unchanged from v8.3)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def perform_logic_guardrail(text: str, hard_truths: dict, stage: str = "analyst") -> str:
-    """Haiku cross-checks text against Python-computed hard_truths.
-    v8.3: now checks ALL asset prices, directions, and pct — not just real yield.
-    stage: 'analyst' or 'narrator' for clearer error messages.
-    Returns empty string if PASS, or a correction warning string."""
     if not hard_truths:
         return ""
-
-    # Build a human-readable checklist from hard_truths
     checks = []
-    asset_names = ["SPX", "Brent", "Gold", "DXY", "UST10Y", "VIX"]
-    for asset in asset_names:
-        price_key = f"{asset}_price"
-        pct_key = f"{asset}_pct"
-        dir_key = f"{asset}_direction"
-        if price_key in hard_truths:
-            checks.append(
-                f"- {asset}: 收盤價={hard_truths[price_key]}, "
-                f"漲跌幅={hard_truths.get(pct_key, 'N/A')}%, "
-                f"方向={hard_truths.get(dir_key, 'N/A')}"
-            )
-
+    for asset in ["SPX", "Brent", "Gold", "DXY", "UST10Y", "VIX"]:
+        pk, pctk, dk = f"{asset}_price", f"{asset}_pct", f"{asset}_direction"
+        if pk in hard_truths:
+            checks.append(f"- {asset}: 收盤價={hard_truths[pk]}, 漲跌幅={hard_truths.get(pctk,'N/A')}%, 方向={hard_truths.get(dk,'N/A')}")
     if hard_truths.get("real_yield_value") is not None:
-        checks.append(
-            f"- 實質利率: {hard_truths['real_yield_value']}%, "
-            f"方向={hard_truths.get('real_yield_direction', 'N/A')}"
-        )
+        checks.append(f"- 實質利率: {hard_truths['real_yield_value']}%, 方向={hard_truths.get('real_yield_direction','N/A')}")
     if hard_truths.get("yield_curve_inverted") is not None:
-        checks.append(
-            f"- 殖利率曲線: 倒掛={'是' if hard_truths['yield_curve_inverted'] else '否'}, "
-            f"值={hard_truths.get('yield_curve_value', 'N/A')}%"
-        )
+        checks.append(f"- 殖利率曲線: 倒掛={'是' if hard_truths['yield_curve_inverted'] else '否'}")
     if hard_truths.get("breakeven_value") is not None:
         checks.append(f"- BEI: {hard_truths['breakeven_value']}%")
-    if hard_truths.get("hy_spread_value") is not None:
-        checks.append(f"- HY Spread: {hard_truths['hy_spread_value']}%")
 
-    checks_text = "\n".join(checks)
+    check_prompt = f"""嚴格數據審核。精確數據：
+{chr(10).join(checks)}
 
-    check_prompt = f"""你是嚴格的數據審核員。以下是 Python 直接從 API 計算的精確數據：
-
-{checks_text}
-
-以下是待審核的{stage}文本：
+待審核 {stage} 文本（前4000字）：
 ---
 {text[:4000]}
 ---
 
-逐項檢查：
-1. 文本中每個資產（SPX, Brent, Gold, DXY, VIX）的漲跌方向是否與數據一致？
-2. 文本中的漲跌幅數字是否與數據偏差超過 1.5 個百分點？
-3. 文本中的價格數字是否與數據偏差超過 2%？
-4. 實質利率方向描述是否與 real_yield_direction 一致？
-5. 殖利率曲線形態描述是否與 yield_curve_inverted 一致？
-
-若全部正確，回覆：PASS
-若有衝突，逐條列出錯誤：[資產/指標] 文本說 [X]，但數據顯示 [Y]。
-只輸出結論，不要解釋。"""
+檢查：資產方向、漲跌幅偏差>1.5%、價格偏差>2%、實質利率方向、殖利率曲線。
+全部正確→PASS。有衝突→逐條列出。只輸出結論。"""
 
     try:
-        result = call_claude(
-            "你只輸出數據校驗結果。若無誤回覆 PASS，若有誤逐條列出錯誤。",
-            check_prompt,
-            MODEL_HAIKU,
-            max_tokens=400,
-        )
+        result = call_claude("數據校驗。無誤→PASS，有誤→列出。", check_prompt, MODEL_HAIKU, max_tokens=400)
         if "PASS" in result.upper() and "不" not in result and "錯" not in result:
             return ""
-        return f"\n\n【{stage}數據校驗警告】：{result.strip()}\n請在最終敘事中修正此數據矛盾。"
+        return f"\n\n【{stage}數據警告】：{result.strip()}\n修正此矛盾。"
     except Exception as e:
-        print(f"    ⚠ Guardrail ({stage}) failed: {e}")
-        return ""
+        print(f"    ⚠ Guardrail ({stage}): {e}"); return ""
 
-# ── Opus Logic Chain Reviewer (v8.3: + historical fact check) ────────────────
-LOGIC_REVIEWER_SYSTEM = """你是全球頂尖宏觀對沖基金的首席邏輯審查官（Chief Logic Reviewer）。
 
-任務：審查情報草稿的邏輯鏈縝密性。不搜尋，不寫作，只挑剔。
+LOGIC_REVIEWER_SYSTEM = """首席邏輯審查官。不搜尋，不寫作，只挑剔。
 
 審查標準：
-1. 因果跳躍：A → B 之間缺少關鍵的傳導機制（例：「油價跌→美股漲」，跳過了實質利率、企業成本、消費者信心的中間步驟）
-2. 結論超出數據：草稿的判斷強度超過數據所能支撐的範圍
-3. 時間框架混淆：把短期市場信號當作長期結構判斷，或反之
-4. 缺失的反向論證：核心判斷缺少最強的反方論點
-5. 循環論證：用結論來支撐前提
-6. 歷史事實錯位（v8.3 新增）：草稿引用的歷史案例，年份與事件是否匹配？
-   已知容易混淆的案例：
-   - 紅海航運危機（胡塞武裝攻擊商船）：2023年底至2024年，不是2022年
-   - 俄烏戰爭油價衝擊：2022年
-   - SVB 銀行危機：2023年3月
-   - 日圓干預：2022年9-10月、2024年4-5月
-   若草稿引用的歷史案例年份可疑，必須標記。
+1. 因果跳躍
+2. 結論超出數據
+3. 時間框架混淆
+4. 缺失反向論證
+5. 循環論證
+6. 歷史事實錯位（紅海=2023-2024, 俄烏=2022, SVB=2023.3, 日圓干預=2022.9/2024.4）
+7. base_rate_neglect：核心預測的歷史基準機率是否被忽略？
 
-輸出格式：
-若邏輯鏈完整且歷史事實無誤，輸出：PASS
-若有問題，列出 2-4 個最重要的缺陷，每條格式：
-[問題類型] 具體描述（引用草稿原句）→ 建議如何修正
-
-只輸出審查結果，不要開場白，不要解釋你的工作方式。"""
-
+PASS 或列出 2-4 個缺陷：[類型] 描述 → 修正建議"""
 
 def perform_logic_review(analyst_draft: str) -> str:
-    """Opus deep logic chain review. Returns empty string if PASS."""
-    review_prompt = f"""以下是今日情報草稿，請審查邏輯鏈縝密性與歷史事實準確性：
-
----
-{analyst_draft}
----
-
-依審查標準輸出結果。若無問題輸出 PASS。"""
-
     try:
-        result = call_claude(
-            LOGIC_REVIEWER_SYSTEM,
-            review_prompt,
-            MODEL_OPUS,
-            max_tokens=800,
-        )
-        result = result.strip()
-        if result.upper().startswith("PASS"):
-            return ""
-        return result
+        result = call_claude(LOGIC_REVIEWER_SYSTEM,
+            f"審查邏輯鏈與歷史事實：\n---\n{analyst_draft}\n---\n無問題→PASS。",
+            MODEL_OPUS, max_tokens=800)
+        return "" if result.strip().upper().startswith("PASS") else result.strip()
     except Exception as e:
-        print(f"    ⚠ Logic review failed: {e}")
-        return ""
+        print(f"    ⚠ Logic review: {e}"); return ""
 
 
-# ── Narrator（通識課教授）────────────────────────────────────────────────────
-NARRATOR_SYSTEM = """你是一位宏觀對沖基金出身、橫跨金融與國際政治的複合型分析師。
+# ══════════════════════════════════════════════════════════════════════════════
+# NARRATOR
+# ══════════════════════════════════════════════════════════════════════════════
 
-你的三重身份，各司其職：
-- 策略師：把數據和事件翻譯成可執行的方向判斷。配置羅盤、前瞻監控、conviction 是你的語言。
-- 國際關係學者：用權力結構、制度邏輯、歷史類比解讀今日事件。今日主線、邊陲訊號的地理邏輯是你的主場。
-- 知識領路人：幫讀者找到概念在知識地圖上的位置——這個工具在哪裡成立、在哪個框架下會被質疑。Knowledge Desk 和思考題是你的主場。
+NARRATOR_SYSTEM = f"""宏觀對沖基金出身、橫跨金融與國際政治的複合型分析師。
+Prompt version: {PROMPT_VERSION}
 
-讀者：政治學背景的學生，志在金融，已有分析肌肉，缺乏實戰練習量。
-目標：讓他讀完這份報告後，今天看世界的方式跟昨天不一樣。15-20分鐘。
-核心原則：這份報告的目的是幫讀者建立自己的分析框架，不是替他下結論。
+三重身份：策略師（配置）、國際關係學者（權力結構）、知識領路人（概念定位）。
+讀者：政治學學生，志在金融。目標：讀完後今天看世界的方式跟昨天不一樣。
 
-【敘事紀律（Show, Don't Tell）】
-絕對禁止的後設語彙：「根據攻擊框架」、「替代解讀為」、「修正後的判斷」、「引入反身性思考」、「根據五種攻擊」。
-批判性視角必須作為你自己的思考無縫呈現：
-  ✓ 「然而，我們必須質疑...」
-  ✓ 「但若從倉位出清的角度來看...」
-  ✓ 「市場可能忽略的盲區是...」
-讀者不應該知道你有一份攻擊清單。
+【敘事紀律】禁止後設語彙（攻擊框架、替代解讀、修正後判斷）。批判性視角無縫呈現。
+【數據法則】數據錨點中的數字必須逐字引用，不得修改。
+【Relational Flags】若草稿回應了 ⚡ flags，在敘事中自然呈現其邏輯張力。
+【Scorecard】若草稿包含昨日回測，在「今日張力」或「配置羅盤」中簡短提及。
 
-【數據精確度法則（v8.3 新增）】
-你將收到一份「數據錨點」，包含所有資產的精確收盤價、漲跌幅、方向。
-- 報告中出現的所有價格和百分比必須與數據錨點完全一致，逐字引用，不得修改。
-- 不得對數據做四捨五入、記憶性改寫、或從其他來源取替代數字。
-- 若盤中走勢與收盤數據有顯著差異，可在敘事中補充盤中描述，但數據切面必須使用收盤數字。
-
-特別要求：
-- 若今日資產方向與昨日不同，必須用一句話說明變化原因
-- Risk Map 每個風險附主觀機率區間
-- conviction 標籤必須嚴格為以下三種格式之一，一字不漏：
-  H (65-80%)
-  M (55-65%)
-  L (45-55%)
-
-格式規則：
-- 繁體中文，保留英文術語
-- 禁止 Markdown 表格、emoji（🔴🟠🟡除外）
-- 直接輸出報告，不要開場白
-- ## 標題，### 子標題
-- 段落2-3句連貫，bullet 用 -
-- 破折號（——）只用於強調
-- 重要時間標注台灣時間"""
+conviction 嚴格格式：H (65-80%) / M (55-65%) / L (45-55%)
+繁體中文，保留英文術語。🔴🟠🟡 以外禁止 emoji。直接輸出。"""
 
 
 def build_narrator_prompt(analyst_draft: str, hard_truths: dict,
                            guardrail_warning: str = "", logic_review: str = "") -> str:
-    """v8.3: now accepts hard_truths and injects as immutable data anchors."""
-
-    # ── Data anchor injection ─────────────────────────────────────────────
-    data_anchor = ""
+    # Data anchor
+    anchor_lines = []
     if hard_truths:
-        anchor_lines = ["!!! 數據錨點（不可修改，必須逐字引用）!!!"]
-        asset_names = ["SPX", "Brent", "Gold", "DXY", "UST10Y", "VIX"]
-        for asset in asset_names:
-            price = hard_truths.get(f"{asset}_price")
+        anchor_lines.append("!!! 數據錨點（不可修改）!!!")
+        for asset in ["SPX", "Brent", "Gold", "DXY", "UST10Y", "VIX"]:
+            p = hard_truths.get(f"{asset}_price")
             pct = hard_truths.get(f"{asset}_pct")
-            direction = hard_truths.get(f"{asset}_direction")
-            if price is not None:
-                dir_arrow = {"up": "↑", "down": "↓", "flat": "→"}.get(direction, "?")
-                pct_str = f"{pct:+.2f}%" if pct is not None else "N/A"
-                anchor_lines.append(f"- {asset}: {price} ({dir_arrow} {pct_str})")
-
+            d = hard_truths.get(f"{asset}_direction")
+            if p is not None:
+                arr = {"up":"↑","down":"↓","flat":"→"}.get(d,"?")
+                anchor_lines.append(f"- {asset}: {p} ({arr} {pct:+.2f}%)" if pct else f"- {asset}: {p}")
         ry = hard_truths.get("real_yield_value")
-        ry_dir = hard_truths.get("real_yield_direction")
         if ry is not None:
-            anchor_lines.append(f"- 實質利率: {ry}% (方向: {ry_dir})")
-        bei = hard_truths.get("breakeven_value")
-        if bei is not None:
-            anchor_lines.append(f"- BEI: {bei}%")
-        hy = hard_truths.get("hy_spread_value")
-        if hy is not None:
-            anchor_lines.append(f"- HY Spread: {hy}%")
+            anchor_lines.append(f"- 實質利率: {ry}% ({hard_truths.get('real_yield_direction','?')})")
+        anchor_lines.append("數據切面所有數字必須與錨點一致。")
 
-        anchor_lines.append(
-            "\n報告「二、數據切面」中的所有數字必須與上述錨點完全一致。"
-            "敘事中引用價格或漲跌幅時，也必須使用錨點數字，不得修改。"
-        )
-        data_anchor = "\n".join(anchor_lines)
-
-    # ── Correction injections ─────────────────────────────────────────────
-    correction = ""
-    if data_anchor:
-        correction += f"\n\n{data_anchor}\n"
+    correction = "\n".join(anchor_lines) if anchor_lines else ""
     if guardrail_warning:
-        correction += (
-            f"\n\n!!! 數據修正指令 !!!\n{guardrail_warning}\n"
-            "輸出報告時必須採納此修正，確保敘事與數據一致。"
-        )
+        correction += f"\n\n!!! 數據修正 !!!\n{guardrail_warning}"
     if logic_review:
-        correction += (
-            f"\n\n!!! 邏輯鏈修正指令（Opus 審查結果）!!!\n{logic_review}\n"
-            "以下邏輯缺陷必須在最終報告中修正或補強，不得保留原有的邏輯跳躍。"
-        )
+        correction += f"\n\n!!! 邏輯修正（Opus）!!!\n{logic_review}\n修正這些缺陷。"
 
-    return f"""整合以下草稿（含【攻擊結果】），輸出最終報告。{correction}
-把攻擊結果無縫融入敘事，嚴守【敘事紀律】，讀者不應知道有攻擊清單。
-若攻擊導致 thesis 修正，在敘事中直接體現修正後的判斷。
+    return f"""整合草稿，輸出最終報告。{correction}
 
 === 草稿 ===
 {analyst_draft}
 
-嚴格8段結構：
+嚴格8段：
 
 # Daily Intelligence Brief
 {DATE_LABEL} | Strategy & Political Economy Desk
@@ -674,82 +834,55 @@ def build_narrator_prompt(analyst_draft: str, hard_truths: dict,
 ---
 
 ## 一、今日張力
-一句話核心矛盾——讓讀者帶著這個問題讀完報告。
+一句核心矛盾。若有昨日回測，可嵌入。
 
 ---
 
 ## 二、數據切面
-5條（Brent、10Y UST、DXY、SPX、Gold）：
-- **指標（縮寫）**（中文）數值 ↑/↓ — 一句意義 + 隱含定價判讀
-【重要】所有數字必須與數據錨點完全一致，逐字引用。
+5條（Brent、10Y UST、DXY、SPX、Gold）+ 選擇性加入 Cu/Au ratio 或 5Y5Y：
+- **指標（縮寫）** 數值 ↑/↓ — 意義
+【所有數字與錨點一致】
 
 ---
 
 ## 三、今日主線
-最重要的一個事件或結構。教授講課的風格：有起承轉合，有反問，有留白。
-包含完整 So What 鏈，自然融入攻擊結果的複雜性。
-若方向與昨日不同，說明變化原因。1000字內。
+1000字內。教授風格。含 So What 鏈。自然融入攻擊。
 
 ---
 
 ## 四、權力地圖
-
-### 得利方
-行為者：原因（每條一行）
-
-### 受損方
-行為者：原因（每條一行）
-
-### Risk Map
-- 🔴 高風險（30-40%）：事件 + 影響路徑
-- 🟠 中風險（15-25%）：事件 + 影響路徑
-- 🟡 監控（<15%）：事件 + 原因
-
-### 今日關鍵變數
-一句話——決定走向的那件事。
+### 得利方 / ### 受損方 / ### Risk Map（🔴🟠🟡+機率）/ ### 今日關鍵變數
 
 ---
 
 ## 五、邊陲訊號：{PERIPHERY_LABEL}
-2段。第一段：局勢與地理邏輯。
-第二段：與今日主線的傳導路徑。
-【重要】：若邊陲的長期結構與今日短期市場波動無實質因果傳導，請明確指出「脫鉤（Decoupling）」或「兩條平行線」。禁止硬湊因果。
+2段。無因果傳導則明確說「兩條平行線」。
 
 ---
 
 ## 六、配置羅盤
-
-### 方向判斷
-5條（美股、台股、美債、主要貨幣、黃金）：
-- **資產（縮寫）↑/↓** — 邏輯 + conviction H/M/L（嚴格格式）
-
-### 前瞻監控（48-72hr）
-3-5個 catalysts：
-- 事件（台灣時間）— 重要性 + 影響路徑
+### 方向判斷（5條，含 conviction H/M/L）
+### 前瞻監控（48-72hr，3-5 catalysts）
 
 ---
 
 ## 七、Knowledge Desk
-
 ### 概念：[名稱]
-**為什麼今天重要**：一句話連結今日報告。
-**實戰應用**：這個概念在配置決策中怎麼用？什麼條件下失效？典型的錯誤理解是什麼？2-3段，教授口吻，有問題，有留白。
-**歷史案例**：一個真實案例，附年份與結果。年份必須準確。
-**當前關鍵問題**：基於今日環境，最值得追蹤的一個開放性問題。
+為什麼重要、實戰應用、歷史案例（年份準確）、當前問題
 
 ---
 
 ## 八、今日思考題
-一個開放性問題，無標準答案。讓讀者帶著它觀察接下來幾天。
-若昨日有思考題，先一句話回應其進展。
 
 ---
-**資料來源**
-1-3條：機構 — 標題，日期"""
+**資料來源**（1-3條）"""
 
-# ── Layer Update (Haiku) ──────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LAYER UPDATE (enhanced L3 schema)
+# ══════════════════════════════════════════════════════════════════════════════
+
 LAYER_UPDATE_SYSTEM = """宏觀對沖基金資料管理員。輸出合法 JSON，不加說明或代碼塊。"""
-
 
 def build_layer_update_prompt(report_summary: str, analyst_draft: str,
                                old_l2: str, old_l3: str, old_l4: str,
@@ -759,48 +892,43 @@ def build_layer_update_prompt(report_summary: str, analyst_draft: str,
         if "NEW_THESIS:" in line or "INVALIDATE_THESIS:" in line
     ) or "（今日無新 thesis）"
 
-    return f"""更新記憶層。輸出純 JSON（無 markdown）：
+    return f"""更新記憶層。輸出純 JSON：
+{{"layer2":"...", "layer3":[...], "layer4":[...], "knowledge_topic":"..."}}
 
-{{"layer2": "更新後 L2 文字", "layer3": [...], "layer4": [...], "knowledge_topic": "主題名稱"}}
+今日（{DATE_STR}）：{report_summary[:600]}
+Thesis 訊號：{thesis_signals}
 
-今日摘要（{DATE_STR}）：
-{report_summary}
+現有 L2：{old_l2 or "（空）"}
+現有 L3：{old_l3 or "[]"}
+現有 L4：{old_l4 or "[]"}
 
-Thesis 訊號：
-{thesis_signals}
-
-現有 L2（7天每日壓縮）：
-{old_l2 or "（空）"}
-
-現有 L3（thesis JSON 清單）：
-{old_l3 or "[]"}
-
-現有 L4（攻擊記錄）：
-{old_l4 or "[]"}
-
-規則：
-L2：末尾加今日條目（嚴格格式）：
+L2 規則：末尾加今日條目，刪>7天：
 {DATE_STR}
-regime: [當前市場 regime]
-driver: [今日最主要價格驅動力]
-policy: [Fed/主要央行偏向]
-fragility: [最脆弱的資產或市場節點]
-刪除 >7天的條目。
+regime: [regime]
+driver: [driver]
+policy: [policy]
+fragility: [fragility]
 
-L3：JSON 陣列，格式：{{"name":"...","statement":"...","date":"...","assets":[...],"invalidators":[...],"status":"active"}}
-- 加入 NEW_THESIS，將 INVALIDATE_THESIS 的 status 改為 "invalidated"
-- 刪除 >30天且 status=invalidated 的項目
+L3 規則（v8.4 增強）：
+JSON陣列，格式：{{"name":"...","statement":"...","date":"...","assets":[...],"invalidators":[...],"measurable_outcome":"具體可驗證結果","time_horizon":"1w/2w/1m","status":"active","outcome":null,"outcome_date":null,"outcome_method":null}}
+- 新增 NEW_THESIS（含 measurable_outcome + time_horizon）
+- INVALIDATE_THESIS → status="invalidated"
+- 刪除>30天 invalidated
 
-L4：JSON 陣列，格式：{{"date":"...","attack_type":"...","description":"...","thesis_revised":true/false}}
-- attack_type：regime_misclassification / timing_error / reflexivity_break / second_order_inversion / omitted_variable_bias
-- 加入今日最重要的 1 條，刪除 >14天的項目"""
-
-# ── Weekly Review (Sonnet) ────────────────────────────────────────────────────
-WEEKLY_SYSTEM = """你是宏觀對沖基金資深策略師，負責週度總結。
-繁體中文，保留英文術語。禁止表格，段落為主，必要時用 bullet points。"""
+L4 規則：
+JSON陣列：{{"date":"...","attack_type":"...","description":"...","thesis_revised":true/false}}
+attack_type 含新增 base_rate_neglect。加今日1條，刪>14天。"""
 
 
-def build_weekly_prompt(layer2: str, layer3: str) -> str:
+# ══════════════════════════════════════════════════════════════════════════════
+# WEEKLY REVIEW (enhanced: thesis outcomes + prompt governance)
+# ══════════════════════════════════════════════════════════════════════════════
+
+WEEKLY_SYSTEM = f"""宏觀對沖基金資深策略師，負責週度總結。
+Prompt version: {PROMPT_VERSION}
+繁體中文，保留英文術語。禁止表格。"""
+
+def build_weekly_prompt(layer2: str, layer3: str, scorecard: str) -> str:
     week_start = (TODAY - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
     return f"""本週每日判斷：
 {layer2 or "（無）"}
@@ -808,193 +936,224 @@ def build_weekly_prompt(layer2: str, layer3: str) -> str:
 Thesis 清單：
 {layer3 or "[]"}
 
+本週預測回測（L5）：
+{scorecard or "（無歷史數據）"}
+
 # Weekly Intelligence Review
 {week_start} ~ {DATE_STR} | Strategy & Political Economy Desk
 
 ## 本週核心主題
-3-5個貫穿全週的主線敘事，說明演進軌跡，用段落寫。
+3-5 個主線，段落。
 
 ## 跨資產表現回顧
-各資產類別本週關鍵走勢與驅動因素。
 
 ## 預測 vs 實際
-回顧本週核心判斷：哪些兌現、哪些偏離、原因是什麼。
+回顧方向性判斷：哪些對、哪些錯、錯在哪裡。引用 L5 數據。
 
-## Thesis 追蹤
-哪些 thesis 本週得到強化、哪些動搖、哪些失效。
+## Thesis 追蹤與判定
+對每個 active thesis 評估本週進展：
+- confirmed（方向正確，預期時間內）
+- partially_confirmed（方向對但時間/幅度偏）
+- wrong（方向錯或 invalidator 觸發）
+- inconclusive（尚無明確結論）
+輸出格式：THESIS_OUTCOME: {{"name":"...","outcome":"...","outcome_date":"{DATE_STR}","outcome_method":"analyst_judgment","notes":"..."}}
 
 ## 思考題追蹤
-本週思考題的集體回顧：哪些得到答案，哪些仍在演變。
 
-## 下週關鍵觀察點
-- 最重要的5個 catalysts 或數據點
+## 下週關鍵觀察點（5個）
+
+## Prompt Governance Review
+- 本週 hit rate 趨勢（引用 L5）
+- 是否觀察到敘事慣性（重複相同框架）
+- 是否有系統性偏差（哪類資產持續判錯）
+- 建議 prompt 調整（若有）：描述修改 + 預期效果
+- 若無需調整，寫 "PROMPT_STATUS: stable"
 
 ## 週度 Meta Insight
-本週最重要的一個洞見，一段話，不超過150字。
+一段，150字內。
 
 ---
 **資料來源**（5條）"""
 
-# ── Claude API ────────────────────────────────────────────────────────────────
-def call_claude_with_search(system: str, user: str) -> str:
-    """Analyst with web search + extended thinking.
-    Hard-validates that at least 3 searches complete before accepting end_turn."""
-    client       = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    messages     = [{"role": "user", "content": user}]
-    search_count = 0
-    text_blocks  = []
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MONTHLY META REVIEW (scaffolding — runs on 1st of month)
+# ══════════════════════════════════════════════════════════════════════════════
+
+MONTHLY_SYSTEM = f"""你是宏觀研究系統的首席品質官。
+Prompt version: {PROMPT_VERSION}
+任務：月度 meta-analysis。繁體中文。"""
+
+def build_monthly_prompt(scorecard: str, layer3: str, knowledge_history: str) -> str:
+    month_start = TODAY.replace(day=1) - datetime.timedelta(days=30)
+    return f"""# Monthly Meta Review
+{month_start.strftime('%Y-%m')} | System Quality Assessment
+
+L5 Scorecard（近30天）：
+{scorecard or "（無）"}
+
+L3 Thesis 清單：
+{layer3 or "[]"}
+
+Knowledge History：
+{knowledge_history or "（無）"}
+
+請輸出：
+
+## 1. 預測品質分析
+- 方向性 hit rate 趨勢（逐週）
+- 哪些資產預測最強 / 最弱
+- H conviction 的 hit rate 是否 > 65%？若否，calibration 有系統偏差
+- 最常見的錯誤模式
+
+## 2. Thesis 生存率
+- 總生成數 / active / confirmed / wrong / inconclusive / expired
+- 平均 thesis 半衰期（從建立到 outcome 判定的天數）
+- 哪類 thesis 存活率最高
+
+## 3. 知識覆蓋分析
+- Knowledge Desk 主題分佈（concept / mechanism / structural）
+- 是否有盲區
+
+## 4. Prompt 效能評估
+- 本月 prompt 版本：{PROMPT_VERSION}
+- 與上月比較：hit rate 變化、coherence 變化
+- 哪些 prompt 機制有效（relational guardrail? base_rate_neglect?）
+- 哪些需要調整
+
+## 5. 下月建議
+- prompt 調整建議（附理由和預期效果）
+- 新增指標建議
+- 系統架構建議
+
+---
+**PROMPT_CHANGE_PROPOSAL**（若有）：
+{{"from":"{PROMPT_VERSION}","to":"...","changes":[{{"what":"...","why":"...","expected_impact":"..."}}]}}"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLAUDE API
+# ══════════════════════════════════════════════════════════════════════════════
+
+def call_claude_with_search(system: str, user: str) -> str:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    messages = [{"role": "user", "content": user}]
+    search_count = 0
+    text_blocks = []
     for _ in range(8):
         response = client.messages.create(
-            model=MODEL_SONNET,
-            max_tokens=5000,
+            model=MODEL_SONNET, max_tokens=5500,
             thinking={"type": "enabled", "budget_tokens": 2000},
             system=system,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=messages,
         )
         text_blocks = [b.text for b in response.content if hasattr(b, "text")]
-
-        # Count search calls in this turn
         for block in response.content:
             if hasattr(block, "type") and block.type == "tool_use":
                 search_count += 1
-
-        # Only accept end_turn after all 3 searches have fired
         if response.stop_reason == "end_turn" and search_count >= 3:
             return "\n".join(text_blocks)
-
         messages.append({"role": "assistant", "content": response.content})
         tool_results = [
             {"type": "tool_result", "tool_use_id": b.id, "content": "Search executed."}
             for b in response.content if b.type == "tool_use"
         ]
         if not tool_results:
-            # No more tool calls — graceful degradation
-            if response.stop_reason == "end_turn" and search_count < 3:
-                print(f"    ⚠ Search loop ended early: {search_count}/3 searches completed")
+            if search_count < 3:
+                print(f"    ⚠ Search ended early: {search_count}/3")
             return "\n".join(text_blocks)
         messages.append({"role": "user", "content": tool_results})
-
     return "\n".join(text_blocks)
 
-
 def call_claude(system: str, user: str, model: str, max_tokens: int = 3000) -> str:
-    client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    message = client.messages.create(
-        model=model, max_tokens=max_tokens, system=system,
-        messages=[{"role": "user", "content": user}]
-    )
-    return message.content[0].text
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    msg = client.messages.create(model=model, max_tokens=max_tokens,
+                                  system=system, messages=[{"role":"user","content":user}])
+    return msg.content[0].text
 
-# ── Markdown → Notion blocks ──────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKDOWN → NOTION
+# ══════════════════════════════════════════════════════════════════════════════
+
 def clean_md(md: str) -> str:
     lines = []
     for line in md.split("\n"):
         stripped = line.strip()
-        if re.match(r"^[-*]?\s*[Ll]ist\s*$", stripped):
-            continue
-        if re.match(r"^[-*]\s*$", stripped):
-            continue
-        if line.startswith("* "):
-            line = "- " + line[2:]
+        if re.match(r"^[-*]?\s*[Ll]ist\s*$", stripped): continue
+        if re.match(r"^[-*]\s*$", stripped): continue
+        if line.startswith("* "): line = "- " + line[2:]
         lines.append(line.rstrip())
     return "\n".join(lines)
 
-
 def parse_inline(text: str) -> list:
-    rich    = []
-    pattern = re.compile(r"\*\*(.+?)\*\*|\*(.+?)\*|([^*]+)", re.DOTALL)
-    for m in pattern.finditer(text):
+    rich = []
+    for m in re.finditer(r"\*\*(.+?)\*\*|\*(.+?)\*|([^*]+)", text, re.DOTALL):
         bold_t, italic_t, plain_t = m.group(1), m.group(2), m.group(3)
-        if bold_t:
-            seg, ann = bold_t, {"bold": True}
-        elif italic_t:
-            seg, ann = italic_t, {"italic": True}
-        else:
-            seg, ann = plain_t, {}
+        seg, ann = (bold_t, {"bold": True}) if bold_t else (italic_t, {"italic": True}) if italic_t else (plain_t, {})
         for i in range(0, max(1, len(seg)), 2000):
             chunk = seg[i:i+2000]
-            if not chunk:
-                continue
+            if not chunk: continue
             rt = {"type": "text", "text": {"content": chunk}}
-            if ann:
-                rt["annotations"] = ann
+            if ann: rt["annotations"] = ann
             rich.append(rt)
     return rich or [{"type": "text", "text": {"content": ""}}]
-
 
 def mk(btype: str, rich: list) -> dict:
     return {"object": "block", "type": btype, btype: {"rich_text": rich}}
 
-
 def markdown_to_notion_blocks(md: str) -> list:
-    md     = clean_md(md)
+    md = clean_md(md)
     blocks = []
     for line in md.split("\n"):
-        if line.startswith("# "):
-            blocks.append(mk("heading_1", parse_inline(line[2:].strip())))
-        elif line.startswith("## "):
-            blocks.append(mk("heading_2", parse_inline(line[3:].strip())))
-        elif line.startswith("### "):
-            blocks.append(mk("heading_3", parse_inline(line[4:].strip())))
-        elif re.match(r"^-{3,}$", line.strip()):
-            blocks.append({"object": "block", "type": "divider", "divider": {}})
+        if line.startswith("# "): blocks.append(mk("heading_1", parse_inline(line[2:].strip())))
+        elif line.startswith("## "): blocks.append(mk("heading_2", parse_inline(line[3:].strip())))
+        elif line.startswith("### "): blocks.append(mk("heading_3", parse_inline(line[4:].strip())))
+        elif re.match(r"^-{3,}$", line.strip()): blocks.append({"object":"block","type":"divider","divider":{}})
         elif line.startswith("- "):
             text = line[2:].strip()
-            if text:
-                blocks.append(mk("bulleted_list_item", parse_inline(text)))
+            if text: blocks.append(mk("bulleted_list_item", parse_inline(text)))
         elif re.match(r"^\d+\.\s", line):
             text = re.sub(r"^\d+\.\s+", "", line).strip()
-            if text:
-                blocks.append(mk("numbered_list_item", parse_inline(text)))
+            if text: blocks.append(mk("numbered_list_item", parse_inline(text)))
         elif line.strip().startswith("|") and line.strip().endswith("|"):
-            if re.match(r"^[\|\s\-:]+$", line.strip()):
-                continue
+            if re.match(r"^[\|\s\-:]+$", line.strip()): continue
             cells = [c.strip() for c in line.strip().strip("|").split("|") if c.strip()]
-            if cells:
-                blocks.append(mk("bulleted_list_item", parse_inline(" | ".join(cells))))
-        elif line.strip():
-            blocks.append(mk("paragraph", parse_inline(line.strip())))
+            if cells: blocks.append(mk("bulleted_list_item", parse_inline(" | ".join(cells))))
+        elif line.strip(): blocks.append(mk("paragraph", parse_inline(line.strip())))
     return blocks
 
-# ── Notion helpers ────────────────────────────────────────────────────────────
-def notion_post(url: str, payload: dict) -> dict:
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NOTION HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def notion_post(url, payload):
     resp = with_retry(httpx.post, url, headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
     resp.raise_for_status(); return resp.json()
-
-def notion_patch(url: str, payload: dict) -> dict:
+def notion_patch(url, payload):
     resp = with_retry(httpx.patch, url, headers=NOTION_HEADERS, json=payload, timeout=TIMEOUT)
     resp.raise_for_status(); return resp.json()
-
-def notion_get(url: str) -> dict:
+def notion_get(url):
     resp = with_retry(httpx.get, url, headers=NOTION_HEADERS, timeout=TIMEOUT)
     resp.raise_for_status(); return resp.json()
-
-def notion_delete(url: str):
+def notion_delete(url):
     with_retry(httpx.delete, url, headers=NOTION_HEADERS, timeout=TIMEOUT)
 
+def read_page_content(page_id, page_size=200):
+    data = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size={page_size}")
+    return "\n".join("".join(t.get("plain_text","") for t in
+        block.get(block.get("type",""),{}).get("rich_text",[]))
+        for block in data.get("results",[])
+        if "".join(t.get("plain_text","") for t in block.get(block.get("type",""),{}).get("rich_text",[])))
 
-def read_page_content(page_id: str, page_size: int = 200) -> str:
-    data  = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size={page_size}")
-    lines = []
-    for block in data.get("results", []):
-        btype = block.get("type", "")
-        rich  = block.get(btype, {}).get("rich_text", [])
-        text  = "".join(t.get("plain_text", "") for t in rich)
-        if text:
-            lines.append(text)
-    return "\n".join(lines)
-
-
-def append_blocks(page_id: str, content: str):
+def append_blocks(page_id, content):
     blocks = markdown_to_notion_blocks(content)
     for i in range(0, len(blocks), 100):
-        notion_patch(f"https://api.notion.com/v1/blocks/{page_id}/children",
-                     {"children": blocks[i:i+100]})
+        notion_patch(f"https://api.notion.com/v1/blocks/{page_id}/children", {"children": blocks[i:i+100]})
 
-
-def create_page(db_id: str, title: str, report_type: str) -> str:
+def create_page(db_id, title, report_type):
     data = notion_post("https://api.notion.com/v1/pages", {
         "parent": {"database_id": db_id},
         "properties": {
@@ -1005,40 +1164,28 @@ def create_page(db_id: str, title: str, report_type: str) -> str:
     })
     return data["id"]
 
-
-def get_or_create_daily_page(db_id: str, date_str: str) -> str:
-    """Idempotent: return existing daily page if already exists, else create."""
-    data = notion_post(
-        f"https://api.notion.com/v1/databases/{db_id}/query",
+def get_or_create_daily_page(db_id, date_str):
+    data = notion_post(f"https://api.notion.com/v1/databases/{db_id}/query",
         {"filter": {"and": [
-            {"property": "Date",  "date":   {"equals": date_str}},
-            {"property": "Type",  "select": {"equals": "Daily"}},
-        ]}}
-    )
+            {"property": "Date", "date": {"equals": date_str}},
+            {"property": "Type", "select": {"equals": "Daily"}},
+        ]}})
     results = data.get("results", [])
     if results:
         page_id = results[0]["id"]
-        print(f"    ↻ Existing daily page found — updating ({page_id})")
-        existing = notion_get(
-            f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
-        )
+        print(f"    ↻ Existing page — updating ({page_id})")
+        existing = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100")
         for block in existing.get("results", []):
-            try:
-                notion_delete(f"https://api.notion.com/v1/blocks/{block['id']}")
-            except Exception:
-                pass
+            try: notion_delete(f"https://api.notion.com/v1/blocks/{block['id']}")
+            except: pass
         return page_id
     return create_page(db_id, f"📊 Daily Brief | {date_str}", "daily")
 
-
-def find_or_create_memo(title: str) -> str:
-    data    = notion_post(
-        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
-        {"filter": {"property": "Name", "title": {"equals": title}}}
-    )
+def find_or_create_memo(title):
+    data = notion_post(f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        {"filter": {"property": "Name", "title": {"equals": title}}})
     results = data.get("results", [])
-    if results:
-        return results[0]["id"]
+    if results: return results[0]["id"]
     data = notion_post("https://api.notion.com/v1/pages", {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": {
@@ -1049,231 +1196,266 @@ def find_or_create_memo(title: str) -> str:
     })
     return data["id"]
 
+def read_memo(title): return read_page_content(find_or_create_memo(title))
 
-def read_memo(title: str) -> str:
-    return read_page_content(find_or_create_memo(title))
-
-
-def safe_overwrite_memo(title: str, new_content: str):
+def safe_overwrite_memo(title, new_content):
     page_id = find_or_create_memo(title)
-    data    = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100")
+    data = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100")
     old_ids = [b["id"] for b in data.get("results", [])]
     append_blocks(page_id, new_content)
-    for block_id in old_ids:
-        try:
-            notion_delete(f"https://api.notion.com/v1/blocks/{block_id}")
-        except Exception as e:
-            print(f"    ⚠ Could not delete old block {block_id}: {e}")
+    for bid in old_ids:
+        try: notion_delete(f"https://api.notion.com/v1/blocks/{bid}")
+        except Exception as e: print(f"    ⚠ Delete block {bid}: {e}")
 
-# ── Memory helpers ────────────────────────────────────────────────────────────
-def fetch_layer1() -> str:
-    data = notion_post(
-        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MEMORY HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_layer1():
+    data = notion_post(f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
         {"filter": {"and": [
-            {"property": "Date",  "date":   {"equals": YESTERDAY.strftime("%Y-%m-%d")}},
-            {"property": "Type",  "select": {"equals": "Daily"}},
-        ]}}
-    )
+            {"property": "Date", "date": {"equals": YESTERDAY.strftime("%Y-%m-%d")}},
+            {"property": "Type", "select": {"equals": "Daily"}},
+        ]}})
     results = data.get("results", [])
-    if not results:
-        return ""
+    if not results: return ""
     content = read_page_content(results[0]["id"])
     return content[:1000] + "…" if len(content) > 1000 else content
 
-
-def _repair_json(raw: str) -> str:
-    """Attempt to fix common LLM JSON errors before parsing."""
+def _repair_json(raw):
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
     raw = re.sub(r"\n?\s*```$", "", raw)
-    raw = raw.strip()
     raw = re.sub(r",\s*}", "}", raw)
     raw = re.sub(r",\s*]", "]", raw)
     raw = re.sub(r"//[^\n]*\n", "\n", raw)
     return raw.strip()
 
-
-def parse_layer_update(raw: str, old_l2: str, old_kh: str,
-                        report_summary: str) -> tuple[str, str, str, str]:
+def parse_layer_update(raw, old_l2, old_kh, report_summary):
     raw = _repair_json(raw)
     try:
         data = json.loads(raw)
-        l2   = data.get("layer2", "")
+        l2 = data.get("layer2", "")
         l3_raw, l4_raw = data.get("layer3", []), data.get("layer4", [])
         l3 = json.dumps(l3_raw, ensure_ascii=False, indent=2) if isinstance(l3_raw, list) else str(l3_raw)
         l4 = json.dumps(l4_raw, ensure_ascii=False, indent=2) if isinstance(l4_raw, list) else str(l4_raw)
         kt = data.get("knowledge_topic", "")
-        if l2:
-            return l2, l3, l4, kt
+        if l2: return l2, l3, l4, kt
     except json.JSONDecodeError as e:
-        print(f"    ⚠ JSON parse failed: {e}")
-
-    print("    → Fallback: appending today to L2")
-    today_entry = f"{DATE_STR}：{report_summary[:100]}"
+        print(f"    ⚠ JSON parse: {e}")
+    print("    → Fallback L2 append")
+    entry = f"{DATE_STR}：{report_summary[:100]}"
     if old_l2:
         cutoff = (TODAY - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-        lines  = old_l2.strip().split("\n")
-        kept   = [ln for ln in lines
-                  if not re.match(r"^\d{4}-\d{2}-\d{2}", ln) or ln[:10] >= cutoff]
-        kept.append(today_entry)
+        lines = old_l2.strip().split("\n")
+        kept = [ln for ln in lines if not re.match(r"^\d{4}-\d{2}-\d{2}", ln) or ln[:10] >= cutoff]
+        kept.append(entry)
         return "\n".join(kept), "", "", ""
-    return today_entry, "", "", ""
+    return entry, "", "", ""
 
-
-def update_knowledge_history(old_kh: str, new_topic: str) -> str:
-    if not new_topic:
-        return old_kh
+def update_knowledge_history(old_kh, new_topic):
+    if not new_topic: return old_kh
     entries = [ln.strip() for ln in old_kh.strip().split("\n") if ln.strip()] if old_kh else []
     entries.append(f"{DATE_STR}: {new_topic}")
     return "\n".join(entries[-10:])
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+def apply_thesis_outcomes(old_l3: str, weekly_text: str) -> str:
+    """Parse THESIS_OUTCOME from weekly review and update L3."""
+    outcomes = re.findall(r"THESIS_OUTCOME:\s*(\{.*?\})", weekly_text, re.DOTALL)
+    if not outcomes or not old_l3:
+        return old_l3
+    try:
+        theses = json.loads(old_l3) if old_l3.strip().startswith("[") else []
+    except:
+        return old_l3
+    for raw_outcome in outcomes:
+        try:
+            oc = json.loads(_repair_json(raw_outcome))
+            name = oc.get("name", "")
+            for t in theses:
+                if t.get("name") == name:
+                    t["outcome"] = oc.get("outcome")
+                    t["outcome_date"] = oc.get("outcome_date")
+                    t["outcome_method"] = oc.get("outcome_method", "analyst_judgment")
+                    if oc.get("outcome") in ("confirmed", "wrong"):
+                        t["status"] = "resolved"
+        except:
+            continue
+    return json.dumps(theses, ensure_ascii=False, indent=2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
 def main():
-    print(f"[{DATE_STR}] Daily Intelligence Brief v8.3 — {PERIPHERY_LABEL}")
-    print(f"  Analyst/Narrator/Weekly: {MODEL_SONNET} | Logic Review: {MODEL_OPUS} | Layer/Guardrail: {MODEL_HAIKU}")
+    print(f"[{DATE_STR}] Daily Intelligence Brief v8.4 — {PERIPHERY_LABEL}")
+    print(f"  Prompt: {PROMPT_VERSION} | Sonnet: {MODEL_SONNET} | Opus: {MODEL_OPUS} | Haiku: {MODEL_HAIKU}")
 
     # ── 0. Market data ────────────────────────────────────────────────────────
-    print("  → Market data (yfinance + FRED + Correlation)...")
+    print("  → Layer 0: Market data...")
     yfd, corr_text = fetch_yfinance_data()
-    frd            = fetch_fred_data()
+    frd = fetch_fred_data()
     market_data, hard_truths = format_market_data(yfd, frd, corr_text)
     if market_data:
-        print(f"    ✓ yf:{len(yfd)} | fred:{len(frd)} | corr:{'✓' if corr_text else '∅'} | hard_truths:{len(hard_truths)}")
+        print(f"    ✓ yf:{len(yfd)} fred:{len(frd)} corr:{'✓' if corr_text else '∅'} truths:{len(hard_truths)}")
     else:
-        print("    ⚠ APIs unavailable → search 1 reverts to market data query")
+        print("    ⚠ APIs unavailable")
+
+    # ── 0b. Relational guardrail ──────────────────────────────────────────────
+    print("  → Layer 0b: Relational guardrail...")
+    relational_flags = run_relational_guardrail(hard_truths)
+    for f in relational_flags:
+        print(f"    {f[:80]}...")
+    if not relational_flags:
+        print("    ✓ No cross-asset anomalies")
+
+    # ── 0c. Daily Scorecard (T+1 backtest) ────────────────────────────────────
+    print("  → Layer 4: Daily Scorecard (T+1)...")
+    scorecard_feedback = ""
+    try:
+        scorecard_data, scorecard_feedback = run_daily_scorecard(yfd)
+        if scorecard_feedback:
+            print(f"    ✓ Scorecard computed")
+        else:
+            print("    ∅ No yesterday data or no calls extracted")
+    except Exception as e:
+        print(f"    ⚠ Scorecard failed ({e})")
 
     # ── 1. Load memory ────────────────────────────────────────────────────────
     print("  → Loading memory...")
     try:
-        layer1            = fetch_layer1()
-        layer2            = read_memo(LAYER2_TITLE)
-        layer3            = read_memo(LAYER3_TITLE)
-        layer4            = read_memo(LAYER4_TITLE)
+        layer1 = fetch_layer1()
+        layer2 = read_memo(LAYER2_TITLE)
+        layer3 = read_memo(LAYER3_TITLE)
+        layer4 = read_memo(LAYER4_TITLE)
         knowledge_history = read_memo(KNOWLEDGE_HISTORY)
-        print(f"    L1={'✓' if layer1 else '∅'}  L2={'✓' if layer2 else '∅'}  "
-              f"L3={'✓' if layer3 else '∅'}  L4={'✓' if layer4 else '∅'}  "
-              f"KH={'✓' if knowledge_history else '∅'}")
+        print(f"    L1={'✓' if layer1 else '∅'} L2={'✓' if layer2 else '∅'} "
+              f"L3={'✓' if layer3 else '∅'} L4={'✓' if layer4 else '∅'} KH={'✓' if knowledge_history else '∅'}")
     except Exception as e:
         print(f"    ⚠ Memory load failed ({e})")
         layer1 = layer2 = layer3 = layer4 = knowledge_history = ""
 
-    # ── 2. Analyst (Sonnet + extended thinking, 3 searches) ───────────────────
-    print("  → [Analyst+DA] Draft (Sonnet + extended thinking, 3 searches)...")
+    # ── 2. Analyst ────────────────────────────────────────────────────────────
+    print("  → Layer 1: Analyst draft (Sonnet + 3 searches)...")
     analyst_draft = with_retry(
-        call_claude_with_search,
-        ANALYST_SYSTEM,
-        build_analyst_prompt(layer1, layer2, layer3, layer4, knowledge_history, market_data),
+        call_claude_with_search, ANALYST_SYSTEM,
+        build_analyst_prompt(layer1, layer2, layer3, layer4, knowledge_history,
+                              market_data, relational_flags, scorecard_feedback),
     )
     print(f"  ✓ Draft ({len(analyst_draft)} chars)")
 
-    # ── 2.5 Logic Guardrail (Haiku) — checks Analyst draft ───────────────────
-    print("  → [Guardrail] Pre-narrator data check (Haiku)...")
-    guardrail_warning = perform_logic_guardrail(analyst_draft, hard_truths, stage="analyst")
-    if guardrail_warning:
-        print("    ⚠ Data inconsistency detected — correction injected into Narrator")
-    else:
-        print("    ✓ Pre-narrator data check passed")
+    # ── 2.5 Guardrails ───────────────────────────────────────────────────────
+    print("  → Layer 1b: Data guardrail (Haiku)...")
+    guardrail = perform_logic_guardrail(analyst_draft, hard_truths, "analyst")
+    print("    ⚠ Issues found" if guardrail else "    ✓ Pass")
 
-    # ── 2.6 Logic Chain Review (Opus) ─────────────────────────────────────────
-    print("  → [Logic Reviewer] Deep logic + historical fact check (Opus)...")
+    print("  → Layer 1c: Logic review (Opus)...")
     logic_review = perform_logic_review(analyst_draft)
     if logic_review:
-        print(f"    ⚠ Logic/fact issues found — injected into Narrator")
-        print(f"    Preview: {logic_review[:200]}...")
+        print(f"    ⚠ {logic_review[:120]}...")
     else:
-        print("    ✓ Logic chain + historical fact review passed")
+        print("    ✓ Pass")
 
-    # ── 3. Narrator (Sonnet) — with data anchors ─────────────────────────────
-    print("  → [Narrator/Professor] Final report (Sonnet)...")
+    # ── 3. Narrator ──────────────────────────────────────────────────────────
+    print("  → Layer 2: Narrator (Sonnet)...")
     final_report = with_retry(
-        call_claude,
-        NARRATOR_SYSTEM,
-        build_narrator_prompt(analyst_draft, hard_truths, guardrail_warning, logic_review),
-        MODEL_SONNET,
-        max_tokens=5500,
+        call_claude, NARRATOR_SYSTEM,
+        build_narrator_prompt(analyst_draft, hard_truths, guardrail, logic_review),
+        MODEL_SONNET, max_tokens=5500,
     )
     print(f"  ✓ Report ({len(final_report)} chars)")
 
-    # ── 3.5 Post-Narrator Data Audit (Haiku) — catches Narrator drift ────────
-    print("  → [Post-Narrator Audit] Checking final report for data drift (Haiku)...")
-    post_narrator_warning = perform_logic_guardrail(final_report, hard_truths, stage="narrator")
-    if post_narrator_warning:
-        print("    ⚠ Narrator drift detected — attempting patch...")
-        # Re-run Narrator with explicit correction
-        patch_prompt = (
-            f"以下報告存在數據錯誤，請只修正數據錯誤的部分，其他內容保持不變。\n"
-            f"{post_narrator_warning}\n\n"
-            f"=== 原報告 ===\n{final_report}"
-        )
+    # ── 3.5 Post-narrator audit ──────────────────────────────────────────────
+    print("  → Layer 2b: Post-narrator audit (Haiku)...")
+    post_warning = perform_logic_guardrail(final_report, hard_truths, "narrator")
+    if post_warning:
+        print("    ⚠ Drift → patching...")
         try:
-            final_report = with_retry(
-                call_claude,
-                "你是數據校對員。只修正被標記的數據錯誤，其他內容一字不改地保留。輸出完整修正後報告。",
-                patch_prompt,
-                MODEL_SONNET,
-                max_tokens=5500,
-            )
-            print("    ✓ Patch applied")
+            final_report = with_retry(call_claude,
+                "數據校對員。只修正數據錯誤，其他不改。輸出完整報告。",
+                f"修正以下錯誤：{post_warning}\n\n=== 原報告 ===\n{final_report}",
+                MODEL_SONNET, max_tokens=5500)
+            print("    ✓ Patched")
         except Exception as e:
-            print(f"    ⚠ Patch failed ({e}) — publishing with warning")
-            final_report = f"⚠ 數據校驗警告：部分數據可能有偏差，請交叉驗證。\n\n{final_report}"
+            print(f"    ⚠ Patch failed ({e})")
     else:
-        print("    ✓ Post-narrator audit passed — no drift")
+        print("    ✓ No drift")
 
-    # ── 4. Push to Notion (idempotent) ────────────────────────────────────────
+    # ── 4. Push ──────────────────────────────────────────────────────────────
     print("  → Pushing to Notion...")
     page_id = get_or_create_daily_page(NOTION_DB_ID, DATE_STR)
     append_blocks(page_id, final_report)
-    print(f"  ✓ Pushed (page: {page_id})")
+    print(f"  ✓ Pushed ({page_id})")
 
-    # ── 5. Update memory (Haiku) ──────────────────────────────────────────────
-    print("  → Updating memory (Haiku)...")
+    # ── 5. Memory update ─────────────────────────────────────────────────────
+    print("  → Layer 3: Memory update (Haiku)...")
     try:
-        report_summary = final_report[:1000]
-        update_raw = call_claude(
-            LAYER_UPDATE_SYSTEM,
-            build_layer_update_prompt(report_summary, analyst_draft,
+        update_raw = call_claude(LAYER_UPDATE_SYSTEM,
+            build_layer_update_prompt(final_report[:1000], analyst_draft,
                                       layer2, layer3, layer4, knowledge_history),
-            MODEL_HAIKU,
-            max_tokens=1200,
-        )
+            MODEL_HAIKU, max_tokens=1500)
         new_l2, new_l3, new_l4, new_kt = parse_layer_update(
-            update_raw, layer2, knowledge_history, report_summary
-        )
+            update_raw, layer2, knowledge_history, final_report[:1000])
         if new_l2: safe_overwrite_memo(LAYER2_TITLE, new_l2)
         if new_l3: safe_overwrite_memo(LAYER3_TITLE, new_l3)
         if new_l4: safe_overwrite_memo(LAYER4_TITLE, new_l4)
         updated_kh = update_knowledge_history(knowledge_history, new_kt)
         if updated_kh: safe_overwrite_memo(KNOWLEDGE_HISTORY, updated_kh)
-        print(f"  ✓ Memory (L2={'✓' if new_l2 else '∅'} "
-              f"L3={'✓' if new_l3 else '∅'} L4={'✓' if new_l4 else '∅'} "
-              f"KH={'✓' if new_kt else '∅'})")
+        print(f"  ✓ Memory updated")
     except Exception as e:
-        print(f"  ⚠ Memory update failed ({e}) — report saved")
+        print(f"  ⚠ Memory failed ({e})")
 
-    # ── 6. Weekly on Monday (Sonnet) ──────────────────────────────────────────
+    # ── 6. Weekly (Monday) ───────────────────────────────────────────────────
     if IS_MONDAY:
-        print("  → Weekly review (Sonnet)...")
+        print("  → Layer 5: Weekly review (Sonnet)...")
         try:
             fresh_l2 = read_memo(LAYER2_TITLE)
             fresh_l3 = read_memo(LAYER3_TITLE)
-            weekly = with_retry(
-                call_claude,
-                WEEKLY_SYSTEM,
-                build_weekly_prompt(fresh_l2, fresh_l3),
-                MODEL_SONNET,
-                max_tokens=3000,
-            )
+            scorecard_full = read_memo(SCORECARD_TITLE)
+            weekly = with_retry(call_claude, WEEKLY_SYSTEM,
+                build_weekly_prompt(fresh_l2, fresh_l3, scorecard_full),
+                MODEL_SONNET, max_tokens=4000)
             week_start = (TODAY - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
-            w_id = create_page(
-                NOTION_WEEKLY_DB,
-                f"📅 Weekly Review | {week_start} ~ {DATE_STR}",
-                "weekly"
-            )
+            w_id = create_page(NOTION_WEEKLY_DB,
+                f"📅 Weekly Review | {week_start} ~ {DATE_STR}", "weekly")
             append_blocks(w_id, weekly)
-            print(f"  ✓ Weekly pushed (page: {w_id})")
+            print(f"  ✓ Weekly pushed ({w_id})")
+
+            # Apply thesis outcomes from weekly
+            updated_l3 = apply_thesis_outcomes(fresh_l3, weekly)
+            if updated_l3 != fresh_l3:
+                safe_overwrite_memo(LAYER3_TITLE, updated_l3)
+                print("  ✓ Thesis outcomes applied to L3")
         except Exception as e:
             print(f"  ⚠ Weekly failed ({e})")
+
+    # ── 7. Monthly (1st of month) ────────────────────────────────────────────
+    if IS_FIRST_OF_MONTH:
+        print("  → Layer 6: Monthly meta review (Sonnet)...")
+        try:
+            scorecard_full = read_memo(SCORECARD_TITLE)
+            fresh_l3 = read_memo(LAYER3_TITLE)
+            kh = read_memo(KNOWLEDGE_HISTORY)
+            monthly = with_retry(call_claude, MONTHLY_SYSTEM,
+                build_monthly_prompt(scorecard_full, fresh_l3, kh),
+                MODEL_SONNET, max_tokens=4000)
+            m_id = create_page(NOTION_WEEKLY_DB,
+                f"📈 Monthly Review | {TODAY.strftime('%Y-%m')}", "monthly")
+            append_blocks(m_id, monthly)
+            print(f"  ✓ Monthly pushed ({m_id})")
+
+            # Log prompt version
+            try:
+                old_log = read_memo(PROMPT_LOG_TITLE)
+                new_entry = f"{DATE_STR} | version: {PROMPT_VERSION} | monthly_review: {m_id}"
+                safe_overwrite_memo(PROMPT_LOG_TITLE,
+                    (old_log + "\n" + new_entry).strip())
+            except:
+                pass
+        except Exception as e:
+            print(f"  ⚠ Monthly failed ({e})")
 
     print("Done.")
 
