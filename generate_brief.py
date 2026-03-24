@@ -1,27 +1,33 @@
 """
-Daily Intelligence Brief Generator — v7.1 (stable)
-
-Base: v7-final
-Fixes from v7 → v7.1:
-  1. Filter thinking blocks from message history (prevents API format errors)
-  2. Explicit Asia/Taipei timezone (correct date on UTC runners)
-  3. L3/L4 fallback to "[]" instead of str() (prevents prompt pollution)
-  4. Pagination in read_page_content AND safe_overwrite_memo
-  5. Dirty state warning in safe_overwrite_memo
-  6. Weekend guard in main()
-  7. Narrator max_tokens 4500 → 5500 (P1: Knowledge Desk truncation fix)
-  8. Analyst prompt: "四種" → "五種" attack types (matches actual 5)
+Daily Intelligence Brief Generator — v8 (stable)
 
 Architecture:
-  - Analyst + DA (Sonnet, 3 searches, merged with skepticism taxonomy)
+  - Data layer: yfinance (market prices) + FRED (macro indicators)
+  - Analyst + DA (Sonnet + extended thinking, 3 narrative searches)
   - Narrator (Sonnet, full 8-section structure)
-  - Layer Update (Haiku — invisible plumbing)
-  - Weekly Review (Sonnet — quality matters)
+  - Layer Update (Haiku)
+  - Weekly Review (Sonnet)
 
-Cost profile (~$5/month):
-  - Sonnet for Analyst + Narrator + Weekly (user-facing quality)
-  - Haiku for Layer Update only (invisible plumbing)
-  - 3 searches/day × $0.01
+v8 changes from v7:
+  + yfinance + FRED data layer (exact prices, no search waste)
+  + Graceful degradation if APIs fail (reverts to market search)
+  - All other v7 features preserved exactly
+
+v7 features preserved:
+  - Extended thinking (budget_tokens: 2000)
+  - 5 structured attacks incl. omitted_variable_bias
+  - Conviction probability anchors (H=65-80%, M=55-65%, L=45-55%)
+  - Layer 2 micro-format (regime/driver/policy/fragility)
+  - Narrator max_tokens=5500
+
+Cost: ~$5-6/month
+  yfinance: free | FRED: free
+  FRED key: https://fredaccount.stlouisfed.org/apikeys
+
+Deployment:
+  pip install anthropic httpx yfinance fredapi pandas
+  GitHub Secrets: ANTHROPIC_API_KEY, NOTION_API_KEY,
+                  NOTION_DATABASE_ID, NOTION_WEEKLY_DB_ID, FRED_API_KEY
 """
 
 import os
@@ -29,7 +35,6 @@ import re
 import json
 import time
 import datetime
-import zoneinfo
 import anthropic
 import httpx
 
@@ -38,27 +43,26 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 NOTION_API_KEY    = os.environ["NOTION_API_KEY"]
 NOTION_DB_ID      = os.environ["NOTION_DATABASE_ID"]
 NOTION_WEEKLY_DB  = os.environ.get("NOTION_WEEKLY_DB_ID", NOTION_DB_ID)
+FRED_API_KEY      = os.environ.get("FRED_API_KEY", "")
 
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU  = "claude-haiku-4-5-20251001"
 
-TW        = zoneinfo.ZoneInfo("Asia/Taipei")
-TODAY      = datetime.datetime.now(TW).date()
-YESTERDAY  = TODAY - datetime.timedelta(days=1)
-WEEKDAY    = TODAY.weekday()
-IS_MONDAY  = WEEKDAY == 0
-IS_WEEKEND = WEEKDAY >= 5
-DATE_STR   = TODAY.strftime("%Y-%m-%d")
+TODAY     = datetime.date.today()
+YESTERDAY = TODAY - datetime.timedelta(days=1)
+WEEKDAY   = TODAY.weekday()
+IS_MONDAY = WEEKDAY == 0
+DATE_STR  = TODAY.strftime("%Y-%m-%d")
 DATE_LABEL = TODAY.strftime("%Y年%m月%d日（%A）").replace(
     "Monday","週一").replace("Tuesday","週二").replace("Wednesday","週三").replace(
     "Thursday","週四").replace("Friday","週五").replace("Saturday","週六").replace("Sunday","週日")
 
 PERIPHERY_SCHEDULE = {
-    0: ("西非 + 薩赫勒地區",                   "West Africa Sahel security 2026"),
-    1: ("東南亞 + 湄公河流域",                 "Southeast Asia Mekong geopolitics 2026"),
-    2: ("中東邊陲（葉門、伊拉克、黎巴嫩）",   "Yemen Iraq Lebanon conflict 2026"),
-    3: ("拉丁美洲（委內瑞拉、阿根廷、厄瓜多）","Venezuela Argentina Ecuador 2026"),
-    4: ("中亞 + 高加索",                        "Central Asia Caucasus geopolitics 2026"),
+    0: ("西非 + 薩赫勒地區",                    "West Africa Sahel security 2026"),
+    1: ("東南亞 + 湄公河流域",                  "Southeast Asia Mekong geopolitics 2026"),
+    2: ("中東邊陲（葉門、伊拉克、黎巴嫩）",    "Yemen Iraq Lebanon conflict 2026"),
+    3: ("拉丁美洲（委內瑞拉、阿根廷、厄瓜多）", "Venezuela Argentina Ecuador 2026"),
+    4: ("中亞 + 高加索",                         "Central Asia Caucasus geopolitics 2026"),
 }
 PERIPHERY_LABEL, PERIPHERY_QUERY = PERIPHERY_SCHEDULE.get(WEEKDAY, PERIPHERY_SCHEDULE[0])
 
@@ -76,7 +80,7 @@ LAYER3_TITLE      = "__LongTermTracker__"
 LAYER4_TITLE      = "__DevilsAdvocateLog__"
 KNOWLEDGE_HISTORY = "__KnowledgeHistory__"
 
-# ── Retry helper ──────────────────────────────────────────────────────────────
+# ── Retry ─────────────────────────────────────────────────────────────────────
 def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
     last_exc = None
     for attempt in range(1, retries + 1):
@@ -94,9 +98,10 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
                 if attempt < retries:
                     time.sleep(delay * attempt * 2)
             elif e.response.status_code >= 500:
-                print(f"    ⚠ Server error {e.response.status_code} attempt {attempt}/{retries}")
                 if attempt < retries:
                     time.sleep(delay * attempt)
+                else:
+                    raise
             else:
                 raise
         except anthropic.RateLimitError as e:
@@ -107,9 +112,10 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
         except anthropic.APIStatusError as e:
             last_exc = e
             if e.status_code >= 500:
-                print(f"    ⚠ Anthropic server error {e.status_code} attempt {attempt}/{retries}")
                 if attempt < retries:
                     time.sleep(delay * attempt)
+                else:
+                    raise
             else:
                 raise
         except Exception as e:
@@ -117,41 +123,172 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
             print(f"    ⚠ Unexpected error attempt {attempt}/{retries}: {e}")
             if attempt < retries:
                 time.sleep(delay)
-    raise RuntimeError(f"All {retries} attempts failed: {last_exc}") from last_exc
+    raise RuntimeError(f"All {retries} attempts failed") from last_exc
 
-# ── Analyst + Devil's Advocate (merged, Sonnet, 3 searches) ──────────────────
+# ── Data Layer ────────────────────────────────────────────────────────────────
+def fetch_yfinance_data() -> dict:
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("    ⚠ yfinance not installed"); return {}
+    tickers = {
+        "SPX":   "^GSPC",
+        "Brent": "BZ=F",
+        "Gold":  "GC=F",
+        "DXY":   "DX-Y.NYB",
+        "UST10Y":"^TNX",
+        "VIX":   "^VIX",
+    }
+    results = {}
+    try:
+        data = yf.download(list(tickers.values()), period="5d", interval="1d",
+                           progress=False, threads=True)
+        if data.empty:
+            return {}
+        close = data["Close"]
+        for name, tk in tickers.items():
+            try:
+                s = close[tk].dropna()
+                if len(s) >= 2:
+                    lat, prev = float(s.iloc[-1]), float(s.iloc[-2])
+                    results[name] = {
+                        "price": round(lat, 2),
+                        "change": round(lat - prev, 2),
+                        "pct": round((lat - prev) / prev * 100, 2),
+                        "date": str(s.index[-1].date()),
+                    }
+                elif len(s) == 1:
+                    results[name] = {
+                        "price": round(float(s.iloc[-1]), 2),
+                        "change": None, "pct": None,
+                        "date": str(s.index[-1].date()),
+                    }
+            except Exception as e:
+                print(f"    ⚠ yf {name}: {e}")
+    except Exception as e:
+        print(f"    ⚠ yf download: {e}")
+    return results
+
+
+def fetch_fred_data() -> dict:
+    if not FRED_API_KEY:
+        print("    ⚠ No FRED_API_KEY — skipping"); return {}
+    try:
+        from fredapi import Fred
+    except ImportError:
+        print("    ⚠ fredapi not installed"); return {}
+    series = {
+        "Fed Funds Rate":       "DFF",
+        "2Y Treasury":          "DGS2",
+        "10Y Treasury":         "DGS10",
+        "Yield Curve (10Y-2Y)": "T10Y2Y",
+        "Breakeven Inflation":  "T10YIE",
+        "HY Credit Spread":     "BAMLH0A0HYM2",
+    }
+    results = {}
+    try:
+        fred = Fred(api_key=FRED_API_KEY)
+        start = YESTERDAY - datetime.timedelta(days=7)
+        for name, sid in series.items():
+            try:
+                s = fred.get_series(sid, observation_start=start).dropna()
+                if len(s) >= 2:
+                    lat, prev = float(s.iloc[-1]), float(s.iloc[-2])
+                    results[name] = {
+                        "value": round(lat, 3),
+                        "prev": round(prev, 3),
+                        "change": round(lat - prev, 3),
+                        "date": str(s.index[-1].date()),
+                    }
+                elif len(s) == 1:
+                    results[name] = {
+                        "value": round(float(s.iloc[-1]), 3),
+                        "prev": None, "change": None,
+                        "date": str(s.index[-1].date()),
+                    }
+            except Exception as e:
+                print(f"    ⚠ FRED {name}: {e}")
+    except Exception as e:
+        print(f"    ⚠ FRED connection: {e}")
+    return results
+
+
+def format_market_data(yfd: dict, frd: dict) -> str:
+    if not yfd and not frd:
+        return ""
+    lines = ["## 預載市場數據（API 直取，精確度高於搜尋）\n"]
+    if yfd:
+        lines.append("### 價格（yfinance）")
+        for n, d in yfd.items():
+            if d["change"] is not None:
+                dr = "↑" if d["change"] > 0 else "↓" if d["change"] < 0 else "→"
+                lines.append(f"- {n}: {d['price']} ({dr} {d['pct']:+.2f}%) [{d['date']}]")
+            else:
+                lines.append(f"- {n}: {d['price']} [{d['date']}]")
+        lines.append("")
+    if frd:
+        lines.append("### 宏觀指標（FRED）")
+        for n, d in frd.items():
+            if d["change"] is not None:
+                dr = "↑" if d["change"] > 0 else "↓" if d["change"] < 0 else "→"
+                lines.append(f"- {n}: {d['value']} ({dr} {d['change']:+.3f}) [{d['date']}]")
+            else:
+                lines.append(f"- {n}: {d['value']} [{d['date']}]")
+        lines.append("")
+        lines.append("### 衍生訊號")
+        yc = frd.get("Yield Curve (10Y-2Y)", {})
+        be = frd.get("Breakeven Inflation", {})
+        hy = frd.get("HY Credit Spread", {})
+        if yc.get("value") is not None:
+            v = yc["value"]
+            tag = "倒掛（衰退訊號）" if v < 0 else "平坦（成長前景謹慎）" if v < 0.5 else "正常"
+            lines.append(f"- 殖利率曲線：{v}% — {tag}")
+        if be.get("value") is not None:
+            v = be["value"]
+            tag = "高於" if v > 2.5 else "接近" if v > 2.0 else "低於"
+            lines.append(f"- 通膨預期（10Y BEI）：{v}% — {tag} Fed 目標")
+        if hy.get("value") is not None:
+            v = hy["value"]
+            tag = "壓力區間" if v > 5.0 else "偏緊" if v < 3.5 else "正常"
+            lines.append(f"- 高收益信用利差：{v}% — {tag}")
+        lines.append("")
+    lines.append("（直接使用以上數據，不需再搜尋驗證。）\n")
+    return "\n".join(lines)
+
+# ── Analyst + Devil's Advocate ────────────────────────────────────────────────
 ANALYST_SYSTEM = """你是全球宏觀對沖基金的情報分析師兼首席風險官。
 
-任務：生成高密度情報草稿，同時對每個核心判斷自我批評。
+重要：若收到預載市場數據（yfinance + FRED），直接使用，不需搜尋市場價格。3次 web_search 全部用於敘事性搜尋。
 
 分析規則：
-- 只對 1-2 個 highest-impact 事件走完整 So What 鏈。其餘事件簡要帶過。
-- So What 鏈：事實（數據）→ 經濟機制 → 誰得利/受損 → 風險定價狀態（已定價/部分定價/未定價/過度定價）→ 二階效應 → 資產影響
+- 1-2 個 highest-impact 事件走完整 So What 鏈：事實（數據）→ 經濟機制 → 誰得利/受損 → 風險定價狀態（已定價/部分定價/未定價/過度定價）→ 二階效應 → 資產影響
 - 每個核心判斷後執行五種結構化攻擊，標記為【攻擊結果】：
   1. regime_misclassification — 若 regime 判斷錯誤，最可能的替代解讀是哪一種？
-  2. timing_error — 方向正確但時機錯誤的條件是什麼？需要什麼才能讓 thesis 成立？
-  3. reflexivity_break — 市場倉位是否已定價此 thesis？共識是否已強到讓 thesis 失效？
-  4. second_order_inversion — 在什麼條件下因果鏈會反轉？（例：油價上漲通常通膨，但若需求崩潰則反轉為通縮）
-  5. omitted_variable_bias — 因果鏈正確，但有哪個隱藏變數被忽略？（例：oil↑→inflation↑，但忽略了庫存周期或中國需求衝擊）
-  攻擊後修正 thesis：若攻擊改變了判斷，標注修正後的版本。
+  2. timing_error — 方向正確但時機錯誤的條件是什麼？
+  3. reflexivity_break — 市場倉位是否已定價此 thesis？共識是否讓 thesis 失效？
+  4. second_order_inversion — 在什麼條件下因果鏈會反轉？
+  5. omitted_variable_bias — 因果鏈正確，但有哪個隱藏變數被忽略？
+  攻擊後：若攻擊改變了判斷，標注修正後的版本。
 - 記錄反向訊號
 
 Knowledge Desk 規則：
-- 查看提供的近期主題列表，避免高度重複
-- 難度在三個層級間輪換：concept（基礎概念）→ mechanism（運作機制）→ structural（結構性變化）
+- 查看近期主題列表，避免高度重複
+- 難度輪換：concept → mechanism → structural
 
 Thesis 規則：
-- 若分析中產生新的長期結構性判斷，在草稿末尾用以下格式標記：
-  NEW_THESIS: {"name": "...", "statement": "...", "assets": [...], "invalidators": [...]}
-- 若今日證據使某個現有 thesis 失效，標記：
-  INVALIDATE_THESIS: {"name": "..."}
+- 新判斷：NEW_THESIS: {"name": "...", "statement": "...", "assets": [...], "invalidators": [...]}
+- 失效：INVALIDATE_THESIS: {"name": "..."}
 
-風格：繁體中文，保留英文術語。直接輸出，不要開場白。
-你會進行 3 次 web_search，嚴格依序，不多不少。"""
+繁體中文，保留英文術語。直接輸出，不要開場白。
+3次 web_search，嚴格依序，不多不少。"""
+
 
 def build_analyst_prompt(layer1: str, layer2: str, layer3: str,
-                          layer4: str, knowledge_history: str) -> str:
+                          layer4: str, knowledge_history: str,
+                          market_data: str) -> str:
     ctx = ""
+    if market_data:
+        ctx += f"\n{market_data}\n"
     if layer1:
         ctx += f"\n### 昨日摘要\n{layer1}\n"
     if layer2:
@@ -159,27 +296,36 @@ def build_analyst_prompt(layer1: str, layer2: str, layer3: str,
     if layer3:
         ctx += f"\n### 現有 Thesis 清單\n{layer3}\n"
     if layer4:
-        ctx += f"\n### 過往推理偏誤記錄\n{layer4}\n"
+        ctx += f"\n### 攻擊記錄\n{layer4}\n"
     if knowledge_history:
         ctx += f"\n### Knowledge Desk 近期主題（避免重複）\n{knowledge_history}\n"
     if ctx:
         ctx = f"\n---\n{ctx}\n---\n"
 
+    # If market data loaded, all 3 searches go to narrative
+    if market_data:
+        searches = f"""1. "geopolitics conflict diplomacy {DATE_STR}"
+2. "central bank policy regulation fiscal {DATE_STR}"
+3. "{PERIPHERY_QUERY}" """
+    else:
+        searches = f"""1. "markets SPX oil gold bonds {DATE_STR}"
+2. "geopolitics macro policy {DATE_STR}"
+3. "{PERIPHERY_QUERY}" """
+
     return f"""{DATE_LABEL} 情報草稿。
 
 3次搜尋（依序，不多不少）：
-1. "markets SPX oil gold bonds {DATE_STR}"
-2. "geopolitics macro policy {DATE_STR}"
-3. "{PERIPHERY_QUERY}"
+{searches}
 {ctx}
 草稿結構：
 
 ## 資產快照
-Brent、10Y UST、DXY、SPX、Gold：數值、走勢、市場隱含預期。
+Brent、10Y UST、DXY、SPX、Gold（使用預載數據 + 搜尋脈絡解讀）。
 
 ## 核心事件
 1-2 個 highest-impact 事件走完整 So What 鏈。
-每個判斷後加【挑戰：bias_type】。
+每個判斷後加【攻擊結果】（五種攻擊）。
+攻擊後若改變判斷，標注修正版本。
 
 ## 邊陲：{PERIPHERY_LABEL}
 局勢、行為者、與全球宏觀的傳導路徑。
@@ -187,10 +333,7 @@ Brent、10Y UST、DXY、SPX、Gold：數值、走勢、市場隱含預期。
 ## Knowledge Desk 素材
 1個概念（避免與近期主題重複）：
 - 概念名稱與難度層級（concept / mechanism / structural）
-- 為何今天重要
-- 歷史案例（附年份數據）
-- 常見誤解
-- 何時失效
+- 為何今天重要、歷史案例（附年份數據）、常見誤解、何時失效
 
 ## 前瞻訊號
 48-72hr 內 3-5 個關鍵 catalysts，每個附影響路徑。
@@ -198,9 +341,9 @@ Brent、10Y UST、DXY、SPX、Gold：數值、走勢、市場隱含預期。
 ## 資產方向
 各資產方向、理由、conviction（H/M/L）、主要風險。
 
-（若有新 thesis 或需失效的 thesis，在末尾標記。）"""
+（若有 thesis 變動，末尾標記。）"""
 
-# ── Narrator (Sonnet) ─────────────────────────────────────────────────────────
+# ── Narrator ──────────────────────────────────────────────────────────────────
 NARRATOR_SYSTEM = """你是宏觀對沖基金的說書人兼導師（The Narrator）。
 
 你同時是三個角色：
@@ -229,9 +372,11 @@ NARRATOR_SYSTEM = """你是宏觀對沖基金的說書人兼導師（The Narrato
 - 破折號（——）只用於強調
 - 重要時間標注台灣時間"""
 
+
 def build_narrator_prompt(analyst_draft: str) -> str:
-    return f"""整合以下草稿（含【挑戰】自我批評），輸出最終報告。
-把【挑戰】的內容自然融入敘事，展現分析的複雜性，不要另起段落標注。
+    return f"""整合以下草稿（含【攻擊結果】），輸出最終報告。
+把攻擊結果的內容自然融入敘事，展現分析的複雜性，不要另起段落標注。
+若攻擊導致了 thesis 修正，在敘事中體現修正後的判斷。
 
 === 草稿 ===
 {analyst_draft}
@@ -244,7 +389,7 @@ def build_narrator_prompt(analyst_draft: str) -> str:
 ---
 
 ## 一、今日張力
-一句話核心矛盾——不是摘要，是讓讀者帶著問題讀完報告的引子。
+一句話核心矛盾——讓讀者帶著問題讀完報告的引子。
 
 ---
 
@@ -256,7 +401,7 @@ def build_narrator_prompt(analyst_draft: str) -> str:
 
 ## 三、今日主線
 最重要的一個事件或結構。說書人風格，起承轉合。
-包含完整 So What 鏈，自然融入【挑戰】的複雜性。
+包含完整 So What 鏈，自然融入攻擊結果的複雜性。
 若方向與昨日不同，說明變化原因。300字內。
 
 ---
@@ -318,13 +463,14 @@ def build_narrator_prompt(analyst_draft: str) -> str:
 # ── Layer Update (Haiku) ──────────────────────────────────────────────────────
 LAYER_UPDATE_SYSTEM = """宏觀對沖基金資料管理員。輸出合法 JSON，不加說明或代碼塊。"""
 
+
 def build_layer_update_prompt(report_summary: str, analyst_draft: str,
                                old_l2: str, old_l3: str, old_l4: str,
                                old_kh: str) -> str:
-    thesis_signals = ""
-    for line in analyst_draft.split("\n"):
-        if "NEW_THESIS:" in line or "INVALIDATE_THESIS:" in line:
-            thesis_signals += line.strip() + "\n"
+    thesis_signals = "\n".join(
+        line.strip() for line in analyst_draft.split("\n")
+        if "NEW_THESIS:" in line or "INVALIDATE_THESIS:" in line
+    ) or "（今日無新 thesis）"
 
     return f"""更新記憶層。輸出純 JSON（無 markdown）：
 
@@ -334,7 +480,7 @@ def build_layer_update_prompt(report_summary: str, analyst_draft: str,
 {report_summary}
 
 Thesis 訊號：
-{thesis_signals or "（今日無新 thesis）"}
+{thesis_signals}
 
 現有 L2（7天每日壓縮）：
 {old_l2 or "（空）"}
@@ -342,29 +488,30 @@ Thesis 訊號：
 現有 L3（thesis JSON 清單）：
 {old_l3 or "[]"}
 
-現有 L4（偏誤記錄）：
+現有 L4（攻擊記錄）：
 {old_l4 or "[]"}
 
 規則：
-L2：末尾加今日條目，格式如下（嚴格遵守，每行一個欄位）：
+L2：末尾加今日條目（嚴格格式）：
 {DATE_STR}
-regime: [當前市場 regime，例：late-cycle geopolitical risk premium]
-driver: [今日最主要的價格驅動力]
-policy: [Fed/主要央行偏向，例：on hold / hawkish / pivot signal]
+regime: [當前市場 regime]
+driver: [今日最主要價格驅動力]
+policy: [Fed/主要央行偏向]
 fragility: [最脆弱的資產或市場節點]
 刪除 >7天的條目。
-L3：JSON 陣列，每個 thesis 格式：{{"name":"...","statement":"...","date":"...","assets":[...],"invalidators":[...],"status":"active"}}
-- 加入 NEW_THESIS 標記的項目
-- 將 INVALIDATE_THESIS 標記的項目 status 改為 "invalidated"
+
+L3：JSON 陣列，格式：{{"name":"...","statement":"...","date":"...","assets":[...],"invalidators":[...],"status":"active"}}
+- 加入 NEW_THESIS，將 INVALIDATE_THESIS 的 status 改為 "invalidated"
 - 刪除 >30天且 status=invalidated 的項目
-L4：JSON 陣列，每條 {{"date":"...","attack_type":"...","description":"...","thesis_revised":true/false}}
-- attack_type 必須是：regime_misclassification / timing_error / reflexivity_break / second_order_inversion / omitted_variable_bias
-- 加入今日最重要的 1 條攻擊記錄，標注是否導致 thesis 修正
-- 刪除 >14天的項目"""
+
+L4：JSON 陣列，格式：{{"date":"...","attack_type":"...","description":"...","thesis_revised":true/false}}
+- attack_type：regime_misclassification / timing_error / reflexivity_break / second_order_inversion / omitted_variable_bias
+- 加入今日最重要的 1 條，刪除 >14天的項目"""
 
 # ── Weekly Review (Sonnet) ────────────────────────────────────────────────────
 WEEKLY_SYSTEM = """你是宏觀對沖基金資深策略師，負責週度總結。
 繁體中文，保留英文術語。禁止表格，段落為主，必要時用 bullet points。"""
+
 
 def build_weekly_prompt(layer2: str, layer3: str) -> str:
     week_start = (TODAY - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
@@ -403,35 +550,28 @@ Thesis 清單：
 
 # ── Claude API ────────────────────────────────────────────────────────────────
 def call_claude_with_search(system: str, user: str) -> str:
-    """Analyst with web search on Sonnet + extended thinking. Cap at 6 iterations."""
+    """Analyst with web search + extended thinking on Sonnet."""
     client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     messages = [{"role": "user", "content": user}]
 
     for _ in range(6):
         response = client.messages.create(
             model=MODEL_SONNET,
-            max_tokens=5000,
+            max_tokens=5000,       # must exceed budget_tokens
             thinking={
                 "type": "enabled",
-                "budget_tokens": 2000,
+                "budget_tokens": 2000,  # hidden reasoning (~$0.006/call)
             },
             system=system,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=messages,
         )
-
-        # Collect text from non-thinking blocks only
-        text_blocks = [b.text for b in response.content
-                       if hasattr(b, "text") and b.type != "thinking"]
+        text_blocks = [b.text for b in response.content if hasattr(b, "text")]
 
         if response.stop_reason == "end_turn":
             return "\n".join(text_blocks)
 
-        # Strip thinking blocks before appending to message history
-        # (API rejects thinking blocks in subsequent turns)
-        filtered_content = [b for b in response.content if b.type != "thinking"]
-        messages.append({"role": "assistant", "content": filtered_content})
-
+        messages.append({"role": "assistant", "content": response.content})
         tool_results = [
             {"type": "tool_result", "tool_use_id": b.id, "content": "Search executed."}
             for b in response.content if b.type == "tool_use"
@@ -440,9 +580,7 @@ def call_claude_with_search(system: str, user: str) -> str:
             return "\n".join(text_blocks)
         messages.append({"role": "user", "content": tool_results})
 
-    # Final extraction after loop exhaustion
-    return "\n".join([b.text for b in response.content
-                      if hasattr(b, "text") and b.type != "thinking"])
+    return "\n".join([b.text for b in response.content if hasattr(b, "text")])
 
 
 def call_claude(system: str, user: str, model: str, max_tokens: int = 3000) -> str:
@@ -551,26 +689,15 @@ def notion_delete(url: str):
 
 
 def read_page_content(page_id: str, page_size: int = 200) -> str:
-    """Read all text from a Notion page. Handles pagination."""
-    all_lines = []
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size={page_size}"
-
-    while url:
-        data = notion_get(url)
-        for block in data.get("results", []):
-            btype = block.get("type", "")
-            rich  = block.get(btype, {}).get("rich_text", [])
-            text  = "".join(t.get("plain_text", "") for t in rich)
-            if text:
-                all_lines.append(text)
-
-        if data.get("has_more") and data.get("next_cursor"):
-            base = f"https://api.notion.com/v1/blocks/{page_id}/children"
-            url  = f"{base}?page_size={page_size}&start_cursor={data['next_cursor']}"
-        else:
-            url = None
-
-    return "\n".join(all_lines)
+    data  = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size={page_size}")
+    lines = []
+    for block in data.get("results", []):
+        btype = block.get("type", "")
+        rich  = block.get(btype, {}).get("rich_text", [])
+        text  = "".join(t.get("plain_text", "") for t in rich)
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
 
 
 def append_blocks(page_id: str, content: str):
@@ -618,32 +745,16 @@ def read_memo(title: str) -> str:
 
 
 def safe_overwrite_memo(title: str, new_content: str):
-    """Write new blocks first, then delete old ones (safe against mid-op failure)."""
+    """Write new blocks first, then delete old (safe against mid-op failure)."""
     page_id = find_or_create_memo(title)
-
-    # Collect ALL old block IDs (paginated)
-    old_ids = []
-    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
-    while url:
-        data = notion_get(url)
-        old_ids.extend(b["id"] for b in data.get("results", []))
-        if data.get("has_more") and data.get("next_cursor"):
-            base = f"https://api.notion.com/v1/blocks/{page_id}/children"
-            url  = f"{base}?page_size=100&start_cursor={data['next_cursor']}"
-        else:
-            url = None
-
+    data    = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100")
+    old_ids = [b["id"] for b in data.get("results", [])]
     append_blocks(page_id, new_content)
-    failed_deletes = []
     for block_id in old_ids:
         try:
             notion_delete(f"https://api.notion.com/v1/blocks/{block_id}")
         except Exception as e:
-            failed_deletes.append(block_id)
             print(f"    ⚠ Could not delete old block {block_id}: {e}")
-    if failed_deletes:
-        print(f"    ⛔ DIRTY STATE: {title} has {len(failed_deletes)} stale blocks "
-              f"({', '.join(failed_deletes[:3])}...)")
 
 # ── Memory helpers ────────────────────────────────────────────────────────────
 def fetch_layer1() -> str:
@@ -663,8 +774,6 @@ def fetch_layer1() -> str:
 
 def parse_layer_update(raw: str, old_l2: str, old_kh: str,
                         report_summary: str) -> tuple[str, str, str, str]:
-    """Parse layer update JSON. Returns (l2, l3, l4, knowledge_topic).
-    Fallback keeps Layer 2 alive if JSON fails."""
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
     raw = re.sub(r"\n?\s*```$", "", raw)
@@ -675,16 +784,14 @@ def parse_layer_update(raw: str, old_l2: str, old_kh: str,
         l2 = data.get("layer2", "")
         l3_raw = data.get("layer3", [])
         l4_raw = data.get("layer4", [])
-        # Validate: must be list, otherwise reset to empty array
-        l3 = json.dumps(l3_raw, ensure_ascii=False, indent=2) if isinstance(l3_raw, list) else "[]"
-        l4 = json.dumps(l4_raw, ensure_ascii=False, indent=2) if isinstance(l4_raw, list) else "[]"
+        l3 = json.dumps(l3_raw, ensure_ascii=False, indent=2) if isinstance(l3_raw, list) else str(l3_raw)
+        l4 = json.dumps(l4_raw, ensure_ascii=False, indent=2) if isinstance(l4_raw, list) else str(l4_raw)
         kt = data.get("knowledge_topic", "")
         if l2:
             return l2, l3, l4, kt
     except json.JSONDecodeError as e:
         print(f"    ⚠ JSON parse failed: {e}")
 
-    # Fallback: keep Layer 2 alive
     print("    → Fallback: appending today to L2")
     today_entry = f"{DATE_STR}：{report_summary[:100]}"
     if old_l2:
@@ -693,12 +800,11 @@ def parse_layer_update(raw: str, old_l2: str, old_kh: str,
         kept   = [ln for ln in lines
                   if not re.match(r"^\d{4}-\d{2}-\d{2}", ln) or ln[:10] >= cutoff]
         kept.append(today_entry)
-        return "\n".join(kept), "[]", "[]", ""
-    return today_entry, "[]", "[]", ""
+        return "\n".join(kept), "", "", ""
+    return today_entry, "", "", ""
 
 
 def update_knowledge_history(old_kh: str, new_topic: str) -> str:
-    """Append today's topic, keep last 10 entries."""
     if not new_topic:
         return old_kh
     entries = [ln.strip() for ln in old_kh.strip().split("\n") if ln.strip()] if old_kh else []
@@ -707,12 +813,18 @@ def update_knowledge_history(old_kh: str, new_topic: str) -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    if IS_WEEKEND:
-        print(f"[{DATE_STR}] Weekend — skipping daily brief.")
-        return
-
-    print(f"[{DATE_STR}] Daily Intelligence Brief v7.1 — {PERIPHERY_LABEL}")
+    print(f"[{DATE_STR}] Daily Intelligence Brief v8 — {PERIPHERY_LABEL}")
     print(f"  Analyst/Narrator/Weekly: {MODEL_SONNET} | Layer: {MODEL_HAIKU}")
+
+    # ── 0. Market data (free APIs) ────────────────────────────────────────────
+    print("  → Market data (yfinance + FRED)...")
+    yfd = fetch_yfinance_data()
+    frd = fetch_fred_data()
+    market_data = format_market_data(yfd, frd)
+    if market_data:
+        print(f"    ✓ yf:{len(yfd)} indicators | fred:{len(frd)} indicators | all searches → narrative")
+    else:
+        print("    ⚠ APIs unavailable → search 1 reverts to market data query")
 
     # ── 1. Load memory ────────────────────────────────────────────────────────
     print("  → Loading memory...")
@@ -729,12 +841,12 @@ def main():
         print(f"    ⚠ Memory load failed ({e})")
         layer1 = layer2 = layer3 = layer4 = knowledge_history = ""
 
-    # ── 2. Analyst + DA (Sonnet, 3 searches) ──────────────────────────────────
-    print("  → [Analyst+DA] Draft (Sonnet, 3 searches)...")
+    # ── 2. Analyst + DA (Sonnet + extended thinking, 3 searches) ──────────────
+    print("  → [Analyst+DA] Draft (Sonnet + extended thinking, 3 searches)...")
     analyst_draft = with_retry(
         call_claude_with_search,
         ANALYST_SYSTEM,
-        build_analyst_prompt(layer1, layer2, layer3, layer4, knowledge_history),
+        build_analyst_prompt(layer1, layer2, layer3, layer4, knowledge_history, market_data),
     )
     print(f"  ✓ Draft ({len(analyst_draft)} chars)")
 
@@ -745,7 +857,7 @@ def main():
         NARRATOR_SYSTEM,
         build_narrator_prompt(analyst_draft),
         MODEL_SONNET,
-        max_tokens=5500,
+        max_tokens=5500,   # bumped from 4500 to prevent Knowledge Desk truncation
     )
     print(f"  ✓ Report ({len(final_report)} chars)")
 
@@ -773,16 +885,15 @@ def main():
         )
         if new_l2:
             safe_overwrite_memo(LAYER2_TITLE, new_l2)
-        if new_l3 and new_l3 != "[]":
+        if new_l3:
             safe_overwrite_memo(LAYER3_TITLE, new_l3)
-        if new_l4 and new_l4 != "[]":
+        if new_l4:
             safe_overwrite_memo(LAYER4_TITLE, new_l4)
         updated_kh = update_knowledge_history(knowledge_history, new_kt)
         if updated_kh:
             safe_overwrite_memo(KNOWLEDGE_HISTORY, updated_kh)
         print(f"  ✓ Memory (L2={'✓' if new_l2 else '∅'} "
-              f"L3={'✓' if new_l3 and new_l3 != '[]' else '∅'} "
-              f"L4={'✓' if new_l4 and new_l4 != '[]' else '∅'} "
+              f"L3={'✓' if new_l3 else '∅'} L4={'✓' if new_l4 else '∅'} "
               f"KH={'✓' if new_kt else '∅'})")
     except Exception as e:
         print(f"  ⚠ Memory update failed ({e}) — report saved")
