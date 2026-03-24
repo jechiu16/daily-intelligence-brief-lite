@@ -602,7 +602,7 @@ def build_narrator_prompt(analyst_draft: str, guardrail_warning: str = "", logic
 ## 六、配置羅盤
 
 ### 方向判斷
-5條（美股、美債、外匯、原油、黃金）：
+5條（美股、台股、美債、主要貨幣、黃金）：
 - **資產（縮寫）↑/↓** — 邏輯 + conviction H/M/L（嚴格格式）
 
 ### 前瞻監控（48-72hr）
