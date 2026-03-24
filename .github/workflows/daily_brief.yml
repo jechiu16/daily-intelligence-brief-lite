@@ -1,12 +1,8 @@
-name: Daily Macro Brief
+name: Daily Macro Brief (v8.5 Flagship)
 
 on:
   schedule:
-    # Every day at 00:00 UTC = 08:00 Taiwan Time (UTC+8)
-    - cron: "0 0 * * 1-5"   # Weekdays only (Mon–Fri)
-    # To include weekends, change to:  "0 0 * * *"
-
-  # Allow manual trigger from GitHub Actions UI
+    - cron: "0 0 * * 1-5"   # 每天台灣時間 08:00 (UTC 00:00)
   workflow_dispatch:
 
 jobs:
@@ -14,11 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: write   # needed for the keep-alive commit
-
+      contents: write   # 關鍵：允許 Actions 將熱圖 push 回 Repo
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,20 +23,34 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install anthropic httpx yfinance fredapi pandas
-      - name: Generate and push brief to Notion
+        run: |
+          pip install anthropic httpx yfinance fredapi pandas matplotlib seaborn
+
+      - name: Generate Brief and Heatmap
         env:
           ANTHROPIC_API_KEY:    ${{ secrets.ANTHROPIC_API_KEY }}
           NOTION_API_KEY:       ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID:   ${{ secrets.NOTION_DATABASE_ID }}
           NOTION_WEEKLY_DB_ID:  ${{ secrets.NOTION_WEEKLY_DB_ID }}
+          FRED_API_KEY:         ${{ secrets.FRED_API_KEY }}
+          GITHUB_REPOSITORY:    ${{ github.repository }}
+          GITHUB_REF_NAME:      ${{ github.ref_name }}
         run: python generate_brief.py
 
-      - name: Keep repo alive (auto-commit timestamp)
+      - name: Commit and Push Heatmap
+        run: |
+          # 檢查是否有新的資產圖片生成
+          if [ -d "assets" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add assets/*.png
+            git commit -m "chore: update correlation heatmap $(date -u '+%Y-%m-%d')" || echo "Nothing to commit"
+            git push
+          fi
+
+      - name: Keep repo alive
         run: |
           echo "Last run: $(date -u '+%Y-%m-%d %H:%M UTC')" > last_run.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add last_run.txt
           git commit -m "chore: keep-alive $(date -u '+%Y-%m-%d')" || echo "Nothing to commit"
           git push
