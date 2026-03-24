@@ -32,6 +32,9 @@ import datetime
 import anthropic
 import httpx
 import pandas as pd
+from zoneinfo import ZoneInfo
+
+_TZ = ZoneInfo("Asia/Taipei")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
@@ -44,7 +47,7 @@ MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU  = "claude-haiku-4-5-20251001"
 MODEL_OPUS   = "claude-opus-4-6"
 
-TODAY     = datetime.date.today()
+TODAY     = datetime.datetime.now(_TZ).date()
 YESTERDAY = TODAY - datetime.timedelta(days=1)
 WEEKDAY   = TODAY.weekday()
 IS_MONDAY = WEEKDAY == 0
@@ -148,7 +151,7 @@ def fetch_yfinance_data() -> tuple[dict, str]:
 
         # Correlation matrix (last 5 days)
         try:
-            subset = close[list(tickers.values())].tail(5)
+            subset = close[list(tickers.values())].tail(20)  # 20-day window: statistically meaningful
             inv = {v: k for k, v in tickers.items()}
             subset.columns = [inv.get(c, c) for c in subset.columns]
             corr = subset.corr()
@@ -719,11 +722,14 @@ Thesis 清單：
 
 # ── Claude API ────────────────────────────────────────────────────────────────
 def call_claude_with_search(system: str, user: str) -> str:
-    """Analyst with web search + extended thinking."""
-    client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    messages = [{"role": "user", "content": user}]
+    """Analyst with web search + extended thinking.
+    Hard-validates that at least 3 searches complete before accepting end_turn."""
+    client       = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    messages     = [{"role": "user", "content": user}]
+    search_count = 0
+    text_blocks  = []
 
-    for _ in range(6):
+    for _ in range(8):
         response = client.messages.create(
             model=MODEL_SONNET,
             max_tokens=5000,
@@ -734,7 +740,13 @@ def call_claude_with_search(system: str, user: str) -> str:
         )
         text_blocks = [b.text for b in response.content if hasattr(b, "text")]
 
-        if response.stop_reason == "end_turn":
+        # Count search calls in this turn
+        for block in response.content:
+            if hasattr(block, "type") and block.type == "tool_use":
+                search_count += 1
+
+        # Only accept end_turn after all 3 searches have fired
+        if response.stop_reason == "end_turn" and search_count >= 3:
             return "\n".join(text_blocks)
 
         messages.append({"role": "assistant", "content": response.content})
@@ -743,10 +755,13 @@ def call_claude_with_search(system: str, user: str) -> str:
             for b in response.content if b.type == "tool_use"
         ]
         if not tool_results:
+            # No more tool calls — graceful degradation
+            if response.stop_reason == "end_turn" and search_count < 3:
+                print(f"    ⚠ Search loop ended early: {search_count}/3 searches completed")
             return "\n".join(text_blocks)
         messages.append({"role": "user", "content": tool_results})
 
-    return "\n".join([b.text for b in response.content if hasattr(b, "text")])
+    return "\n".join(text_blocks)
 
 
 def call_claude(system: str, user: str, model: str, max_tokens: int = 3000) -> str:
@@ -876,6 +891,33 @@ def create_page(db_id: str, title: str, report_type: str) -> str:
     return data["id"]
 
 
+def get_or_create_daily_page(db_id: str, date_str: str) -> str:
+    """Idempotent: return existing daily page if already exists, else create.
+    Prevents duplicate reports on cron retry or manual re-trigger."""
+    data = notion_post(
+        f"https://api.notion.com/v1/databases/{db_id}/query",
+        {"filter": {"and": [
+            {"property": "Date",  "date":   {"equals": date_str}},
+            {"property": "Type",  "select": {"equals": "Daily"}},
+        ]}}
+    )
+    results = data.get("results", [])
+    if results:
+        page_id = results[0]["id"]
+        print(f"    ↻ Existing daily page found — updating ({page_id})")
+        # Clear existing blocks before re-writing
+        existing = notion_get(
+            f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+        )
+        for block in existing.get("results", []):
+            try:
+                notion_delete(f"https://api.notion.com/v1/blocks/{block['id']}")
+            except Exception:
+                pass
+        return page_id
+    return create_page(db_id, f"📊 Daily Brief | {date_str}", "daily")
+
+
 def find_or_create_memo(title: str) -> str:
     data    = notion_post(
         f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
@@ -926,12 +968,23 @@ def fetch_layer1() -> str:
     return content[:1000] + "…" if len(content) > 1000 else content
 
 
-def parse_layer_update(raw: str, old_l2: str, old_kh: str,
-                        report_summary: str) -> tuple[str, str, str, str]:
+def _repair_json(raw: str) -> str:
+    """Attempt to fix common LLM JSON errors before parsing."""
     raw = raw.strip()
     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
     raw = re.sub(r"\n?\s*```$", "", raw)
     raw = raw.strip()
+    # Remove trailing commas before } or ]
+    raw = re.sub(r",\s*}", "}", raw)
+    raw = re.sub(r",\s*]", "]", raw)
+    # Remove single-line JS-style comments
+    raw = re.sub(r"//[^\n]*\n", "\n", raw)
+    return raw.strip()
+
+
+def parse_layer_update(raw: str, old_l2: str, old_kh: str,
+                        report_summary: str) -> tuple[str, str, str, str]:
+    raw = _repair_json(raw)
     try:
         data = json.loads(raw)
         l2   = data.get("layer2", "")
@@ -1030,9 +1083,9 @@ def main():
     )
     print(f"  ✓ Report ({len(final_report)} chars)")
 
-    # ── 4. Push to Notion FIRST ───────────────────────────────────────────────
+    # ── 4. Push to Notion FIRST (idempotent) ─────────────────────────────────
     print("  → Pushing to Notion...")
-    page_id = create_page(NOTION_DB_ID, f"📊 Daily Brief | {DATE_STR}", "daily")
+    page_id = get_or_create_daily_page(NOTION_DB_ID, DATE_STR)
     append_blocks(page_id, final_report)
     print(f"  ✓ Pushed (page: {page_id})")
 
