@@ -1,11 +1,16 @@
 """
-Daily Intelligence Brief Generator — v7 (final)
+Daily Intelligence Brief Generator — v7.1 (stable)
 
-Base: v6-final (production-hardened infrastructure)
-New from v7:
-  1. Knowledge Desk history tracking — avoids topic repetition
-  2. Structured skepticism taxonomy — 7 named bias types for self-critique
-  3. Layer 3 as structured thesis list — JSON with invalidation conditions
+Base: v7-final
+Fixes from v7 → v7.1:
+  1. Filter thinking blocks from message history (prevents API format errors)
+  2. Explicit Asia/Taipei timezone (correct date on UTC runners)
+  3. L3/L4 fallback to "[]" instead of str() (prevents prompt pollution)
+  4. Pagination in read_page_content AND safe_overwrite_memo
+  5. Dirty state warning in safe_overwrite_memo
+  6. Weekend guard in main()
+  7. Narrator max_tokens 4500 → 5500 (P1: Knowledge Desk truncation fix)
+  8. Analyst prompt: "四種" → "五種" attack types (matches actual 5)
 
 Architecture:
   - Analyst + DA (Sonnet, 3 searches, merged with skepticism taxonomy)
@@ -24,6 +29,7 @@ import re
 import json
 import time
 import datetime
+import zoneinfo
 import anthropic
 import httpx
 
@@ -36,11 +42,13 @@ NOTION_WEEKLY_DB  = os.environ.get("NOTION_WEEKLY_DB_ID", NOTION_DB_ID)
 MODEL_SONNET = "claude-sonnet-4-6"
 MODEL_HAIKU  = "claude-haiku-4-5-20251001"
 
-TODAY     = datetime.date.today()
-YESTERDAY = TODAY - datetime.timedelta(days=1)
-WEEKDAY   = TODAY.weekday()
-IS_MONDAY = WEEKDAY == 0
-DATE_STR  = TODAY.strftime("%Y-%m-%d")
+TW        = zoneinfo.ZoneInfo("Asia/Taipei")
+TODAY      = datetime.datetime.now(TW).date()
+YESTERDAY  = TODAY - datetime.timedelta(days=1)
+WEEKDAY    = TODAY.weekday()
+IS_MONDAY  = WEEKDAY == 0
+IS_WEEKEND = WEEKDAY >= 5
+DATE_STR   = TODAY.strftime("%Y-%m-%d")
 DATE_LABEL = TODAY.strftime("%Y年%m月%d日（%A）").replace(
     "Monday","週一").replace("Tuesday","週二").replace("Wednesday","週三").replace(
     "Thursday","週四").replace("Friday","週五").replace("Saturday","週六").replace("Sunday","週日")
@@ -63,7 +71,6 @@ TIMEOUT     = httpx.Timeout(60.0, connect=10.0)
 MAX_RETRIES = 3
 RETRY_DELAY = 5
 
-# Fix: use __ not ** to avoid Markdown bold collision
 LAYER2_TITLE      = "__WeeklyCompressed__"
 LAYER3_TITLE      = "__LongTermTracker__"
 LAYER4_TITLE      = "__DevilsAdvocateLog__"
@@ -87,10 +94,9 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
                 if attempt < retries:
                     time.sleep(delay * attempt * 2)
             elif e.response.status_code >= 500:
+                print(f"    ⚠ Server error {e.response.status_code} attempt {attempt}/{retries}")
                 if attempt < retries:
                     time.sleep(delay * attempt)
-                else:
-                    raise
             else:
                 raise
         except anthropic.RateLimitError as e:
@@ -101,10 +107,9 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
         except anthropic.APIStatusError as e:
             last_exc = e
             if e.status_code >= 500:
+                print(f"    ⚠ Anthropic server error {e.status_code} attempt {attempt}/{retries}")
                 if attempt < retries:
                     time.sleep(delay * attempt)
-                else:
-                    raise
             else:
                 raise
         except Exception as e:
@@ -112,7 +117,7 @@ def with_retry(fn, *args, retries=MAX_RETRIES, delay=RETRY_DELAY, **kwargs):
             print(f"    ⚠ Unexpected error attempt {attempt}/{retries}: {e}")
             if attempt < retries:
                 time.sleep(delay)
-    raise RuntimeError(f"All {retries} attempts failed") from last_exc
+    raise RuntimeError(f"All {retries} attempts failed: {last_exc}") from last_exc
 
 # ── Analyst + Devil's Advocate (merged, Sonnet, 3 searches) ──────────────────
 ANALYST_SYSTEM = """你是全球宏觀對沖基金的情報分析師兼首席風險官。
@@ -122,11 +127,12 @@ ANALYST_SYSTEM = """你是全球宏觀對沖基金的情報分析師兼首席風
 分析規則：
 - 只對 1-2 個 highest-impact 事件走完整 So What 鏈。其餘事件簡要帶過。
 - So What 鏈：事實（數據）→ 經濟機制 → 誰得利/受損 → 風險定價狀態（已定價/部分定價/未定價/過度定價）→ 二階效應 → 資產影響
-- 每個核心判斷後執行四種結構化攻擊，標記為【攻擊結果】：
+- 每個核心判斷後執行五種結構化攻擊，標記為【攻擊結果】：
   1. regime_misclassification — 若 regime 判斷錯誤，最可能的替代解讀是哪一種？
   2. timing_error — 方向正確但時機錯誤的條件是什麼？需要什麼才能讓 thesis 成立？
   3. reflexivity_break — 市場倉位是否已定價此 thesis？共識是否已強到讓 thesis 失效？
   4. second_order_inversion — 在什麼條件下因果鏈會反轉？（例：油價上漲通常通膨，但若需求崩潰則反轉為通縮）
+  5. omitted_variable_bias — 因果鏈正確，但有哪個隱藏變數被忽略？（例：oil↑→inflation↑，但忽略了庫存周期或中國需求衝擊）
   攻擊後修正 thesis：若攻擊改變了判斷，標注修正後的版本。
 - 記錄反向訊號
 
@@ -209,6 +215,10 @@ NARRATOR_SYSTEM = """你是宏觀對沖基金的說書人兼導師（The Narrato
 特別要求：
 - 若今日資產方向與昨日不同，必須用一句話說明變化原因
 - Risk Map 每個風險附主觀機率區間
+- conviction 定義（嚴格遵守，跨日可比）：
+  H = 65–80% 機率方向正確
+  M = 55–65% 機率方向正確
+  L = 45–55% 接近硬幣，方向有根據但不確定
 
 格式規則：
 - 繁體中文，保留英文術語
@@ -336,13 +346,19 @@ Thesis 訊號：
 {old_l4 or "[]"}
 
 規則：
-L2：末尾加 {DATE_STR}：訊號/風險。刪 >7天。
+L2：末尾加今日條目，格式如下（嚴格遵守，每行一個欄位）：
+{DATE_STR}
+regime: [當前市場 regime，例：late-cycle geopolitical risk premium]
+driver: [今日最主要的價格驅動力]
+policy: [Fed/主要央行偏向，例：on hold / hawkish / pivot signal]
+fragility: [最脆弱的資產或市場節點]
+刪除 >7天的條目。
 L3：JSON 陣列，每個 thesis 格式：{{"name":"...","statement":"...","date":"...","assets":[...],"invalidators":[...],"status":"active"}}
 - 加入 NEW_THESIS 標記的項目
 - 將 INVALIDATE_THESIS 標記的項目 status 改為 "invalidated"
 - 刪除 >30天且 status=invalidated 的項目
 L4：JSON 陣列，每條 {{"date":"...","attack_type":"...","description":"...","thesis_revised":true/false}}
-- attack_type 必須是：regime_misclassification / timing_error / reflexivity_break / second_order_inversion
+- attack_type 必須是：regime_misclassification / timing_error / reflexivity_break / second_order_inversion / omitted_variable_bias
 - 加入今日最重要的 1 條攻擊記錄，標注是否導致 thesis 修正
 - 刪除 >14天的項目"""
 
@@ -394,21 +410,28 @@ def call_claude_with_search(system: str, user: str) -> str:
     for _ in range(6):
         response = client.messages.create(
             model=MODEL_SONNET,
-            max_tokens=5000,  # must exceed budget_tokens
+            max_tokens=5000,
             thinking={
                 "type": "enabled",
-                "budget_tokens": 2000,  # hidden reasoning budget (~$0.006/call)
+                "budget_tokens": 2000,
             },
             system=system,
             tools=[{"type": "web_search_20250305", "name": "web_search"}],
             messages=messages,
         )
-        text_blocks = [b.text for b in response.content if hasattr(b, "text")]
+
+        # Collect text from non-thinking blocks only
+        text_blocks = [b.text for b in response.content
+                       if hasattr(b, "text") and b.type != "thinking"]
 
         if response.stop_reason == "end_turn":
             return "\n".join(text_blocks)
 
-        messages.append({"role": "assistant", "content": response.content})
+        # Strip thinking blocks before appending to message history
+        # (API rejects thinking blocks in subsequent turns)
+        filtered_content = [b for b in response.content if b.type != "thinking"]
+        messages.append({"role": "assistant", "content": filtered_content})
+
         tool_results = [
             {"type": "tool_result", "tool_use_id": b.id, "content": "Search executed."}
             for b in response.content if b.type == "tool_use"
@@ -417,7 +440,9 @@ def call_claude_with_search(system: str, user: str) -> str:
             return "\n".join(text_blocks)
         messages.append({"role": "user", "content": tool_results})
 
-    return "\n".join([b.text for b in response.content if hasattr(b, "text")])
+    # Final extraction after loop exhaustion
+    return "\n".join([b.text for b in response.content
+                      if hasattr(b, "text") and b.type != "thinking"])
 
 
 def call_claude(system: str, user: str, model: str, max_tokens: int = 3000) -> str:
@@ -447,7 +472,6 @@ def clean_md(md: str) -> str:
 
 
 def parse_inline(text: str) -> list:
-    # Fix: properly escaped asterisks in regex
     rich    = []
     pattern = re.compile(r"\*\*(.+?)\*\*|\*(.+?)\*|([^*]+)", re.DOTALL)
     for m in pattern.finditer(text):
@@ -527,15 +551,26 @@ def notion_delete(url: str):
 
 
 def read_page_content(page_id: str, page_size: int = 200) -> str:
-    data  = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size={page_size}")
-    lines = []
-    for block in data.get("results", []):
-        btype = block.get("type", "")
-        rich  = block.get(btype, {}).get("rich_text", [])
-        text  = "".join(t.get("plain_text", "") for t in rich)
-        if text:
-            lines.append(text)
-    return "\n".join(lines)
+    """Read all text from a Notion page. Handles pagination."""
+    all_lines = []
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size={page_size}"
+
+    while url:
+        data = notion_get(url)
+        for block in data.get("results", []):
+            btype = block.get("type", "")
+            rich  = block.get(btype, {}).get("rich_text", [])
+            text  = "".join(t.get("plain_text", "") for t in rich)
+            if text:
+                all_lines.append(text)
+
+        if data.get("has_more") and data.get("next_cursor"):
+            base = f"https://api.notion.com/v1/blocks/{page_id}/children"
+            url  = f"{base}?page_size={page_size}&start_cursor={data['next_cursor']}"
+        else:
+            url = None
+
+    return "\n".join(all_lines)
 
 
 def append_blocks(page_id: str, content: str):
@@ -585,14 +620,30 @@ def read_memo(title: str) -> str:
 def safe_overwrite_memo(title: str, new_content: str):
     """Write new blocks first, then delete old ones (safe against mid-op failure)."""
     page_id = find_or_create_memo(title)
-    data    = notion_get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100")
-    old_ids = [b["id"] for b in data.get("results", [])]
+
+    # Collect ALL old block IDs (paginated)
+    old_ids = []
+    url = f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=100"
+    while url:
+        data = notion_get(url)
+        old_ids.extend(b["id"] for b in data.get("results", []))
+        if data.get("has_more") and data.get("next_cursor"):
+            base = f"https://api.notion.com/v1/blocks/{page_id}/children"
+            url  = f"{base}?page_size=100&start_cursor={data['next_cursor']}"
+        else:
+            url = None
+
     append_blocks(page_id, new_content)
+    failed_deletes = []
     for block_id in old_ids:
         try:
             notion_delete(f"https://api.notion.com/v1/blocks/{block_id}")
         except Exception as e:
+            failed_deletes.append(block_id)
             print(f"    ⚠ Could not delete old block {block_id}: {e}")
+    if failed_deletes:
+        print(f"    ⛔ DIRTY STATE: {title} has {len(failed_deletes)} stale blocks "
+              f"({', '.join(failed_deletes[:3])}...)")
 
 # ── Memory helpers ────────────────────────────────────────────────────────────
 def fetch_layer1() -> str:
@@ -615,7 +666,6 @@ def parse_layer_update(raw: str, old_l2: str, old_kh: str,
     """Parse layer update JSON. Returns (l2, l3, l4, knowledge_topic).
     Fallback keeps Layer 2 alive if JSON fails."""
     raw = raw.strip()
-    # Fix: properly escaped backticks on separate lines
     raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
     raw = re.sub(r"\n?\s*```$", "", raw)
     raw = raw.strip()
@@ -625,8 +675,9 @@ def parse_layer_update(raw: str, old_l2: str, old_kh: str,
         l2 = data.get("layer2", "")
         l3_raw = data.get("layer3", [])
         l4_raw = data.get("layer4", [])
-        l3 = json.dumps(l3_raw, ensure_ascii=False, indent=2) if isinstance(l3_raw, list) else str(l3_raw)
-        l4 = json.dumps(l4_raw, ensure_ascii=False, indent=2) if isinstance(l4_raw, list) else str(l4_raw)
+        # Validate: must be list, otherwise reset to empty array
+        l3 = json.dumps(l3_raw, ensure_ascii=False, indent=2) if isinstance(l3_raw, list) else "[]"
+        l4 = json.dumps(l4_raw, ensure_ascii=False, indent=2) if isinstance(l4_raw, list) else "[]"
         kt = data.get("knowledge_topic", "")
         if l2:
             return l2, l3, l4, kt
@@ -642,8 +693,8 @@ def parse_layer_update(raw: str, old_l2: str, old_kh: str,
         kept   = [ln for ln in lines
                   if not re.match(r"^\d{4}-\d{2}-\d{2}", ln) or ln[:10] >= cutoff]
         kept.append(today_entry)
-        return "\n".join(kept), "", "", ""
-    return today_entry, "", "", ""
+        return "\n".join(kept), "[]", "[]", ""
+    return today_entry, "[]", "[]", ""
 
 
 def update_knowledge_history(old_kh: str, new_topic: str) -> str:
@@ -656,7 +707,11 @@ def update_knowledge_history(old_kh: str, new_topic: str) -> str:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"[{DATE_STR}] Daily Intelligence Brief v7 — {PERIPHERY_LABEL}")
+    if IS_WEEKEND:
+        print(f"[{DATE_STR}] Weekend — skipping daily brief.")
+        return
+
+    print(f"[{DATE_STR}] Daily Intelligence Brief v7.1 — {PERIPHERY_LABEL}")
     print(f"  Analyst/Narrator/Weekly: {MODEL_SONNET} | Layer: {MODEL_HAIKU}")
 
     # ── 1. Load memory ────────────────────────────────────────────────────────
@@ -690,7 +745,7 @@ def main():
         NARRATOR_SYSTEM,
         build_narrator_prompt(analyst_draft),
         MODEL_SONNET,
-        max_tokens=4500,
+        max_tokens=5500,
     )
     print(f"  ✓ Report ({len(final_report)} chars)")
 
@@ -718,15 +773,16 @@ def main():
         )
         if new_l2:
             safe_overwrite_memo(LAYER2_TITLE, new_l2)
-        if new_l3:
+        if new_l3 and new_l3 != "[]":
             safe_overwrite_memo(LAYER3_TITLE, new_l3)
-        if new_l4:
+        if new_l4 and new_l4 != "[]":
             safe_overwrite_memo(LAYER4_TITLE, new_l4)
         updated_kh = update_knowledge_history(knowledge_history, new_kt)
         if updated_kh:
             safe_overwrite_memo(KNOWLEDGE_HISTORY, updated_kh)
         print(f"  ✓ Memory (L2={'✓' if new_l2 else '∅'} "
-              f"L3={'✓' if new_l3 else '∅'} L4={'✓' if new_l4 else '∅'} "
+              f"L3={'✓' if new_l3 and new_l3 != '[]' else '∅'} "
+              f"L4={'✓' if new_l4 and new_l4 != '[]' else '∅'} "
               f"KH={'✓' if new_kt else '∅'})")
     except Exception as e:
         print(f"  ⚠ Memory update failed ({e}) — report saved")
