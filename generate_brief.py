@@ -15,9 +15,9 @@ NOTION_DB_ID      = os.environ["NOTION_DATABASE_ID"]
 NOTION_WEEKLY_DB  = os.environ.get("NOTION_WEEKLY_DB_ID", NOTION_DB_ID)
 FRED_API_KEY      = os.environ.get("FRED_API_KEY", "")
 
-# 官方正確 API 模型名稱
-MODEL_SONNET = "claude-3-5-sonnet-20241022"
-MODEL_HAIKU  = "claude-3-5-haiku-20241022"
+# 官方最新 API 模型名稱 (已更新為 4.6 與 4.5 系列)
+MODEL_SONNET = "claude-sonnet-4-6"
+MODEL_HAIKU  = "claude-haiku-4-5-20251001"
 
 TODAY     = datetime.date.today()
 YESTERDAY = TODAY - datetime.timedelta(days=1)
