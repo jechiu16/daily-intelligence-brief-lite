@@ -573,7 +573,7 @@ def build_narrator_prompt(analyst_draft: str, guardrail_warning: str = "", logic
 ## 三、今日主線
 最重要的一個事件或結構。教授講課的風格：有起承轉合，有反問，有留白。
 包含完整 So What 鏈，自然融入攻擊結果的複雜性。
-若方向與昨日不同，說明變化原因。300字內。
+若方向與昨日不同，說明變化原因。1000字內。
 
 ---
 
@@ -605,7 +605,7 @@ def build_narrator_prompt(analyst_draft: str, guardrail_warning: str = "", logic
 ## 六、配置羅盤
 
 ### 方向判斷
-5條（美股、美債、外匯、原油、黃金）：
+5條（美股、台股、美債、主要貨幣、黃金）：
 - **資產（縮寫）↑/↓** — 邏輯 + conviction H/M/L（嚴格格式）
 
 ### 前瞻監控（48-72hr）
