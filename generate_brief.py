@@ -529,6 +529,38 @@ def build_narrator_prompt(analyst_draft: str, guardrail_warning: str = "") -> st
 LAYER_UPDATE_SYSTEM = """宏觀對沖基金資料管理員。輸出合法 JSON，不加說明或代碼塊。"""
 
 
+def parse_layer_update(raw: str, old_l2: str, old_kh: str,
+                        report_summary: str) -> tuple[str, str, str, str]:
+    raw = raw.strip()
+    # 使用 \x60 防彈替代方案，避免 Markdown 解析器在複製貼上時出錯
+    raw = re.sub(r"^\x60\x60\x60(?:json)?\s*\n?", "", raw)
+    raw = re.sub(r"\n?\s*\x60\x60\x60$", "", raw)
+    raw = raw.strip()
+
+    try:
+        data = json.loads(raw)
+        l2 = data.get("layer2", "")
+        l3_raw = data.get("layer3", [])
+        l4_raw = data.get("layer4", [])
+        l3 = json.dumps(l3_raw, ensure_ascii=False, indent=2) if isinstance(l3_raw, list) else str(l3_raw)
+        l4 = json.dumps(l4_raw, ensure_ascii=False, indent=2) if isinstance(l4_raw, list) else str(l4_raw)
+        kt = data.get("knowledge_topic", "")
+        if l2:
+            return l2, l3, l4, kt
+    except json.JSONDecodeError as e:
+        print(f"    ⚠ JSON parse failed: {e}")
+
+    print("    → Fallback: appending today to L2")
+    today_entry = f"{DATE_STR}：{report_summary[:100]}"
+    if old_l2:
+        cutoff = (TODAY - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        lines  = old_l2.strip().split("\n")
+        kept   = [ln for ln in lines
+                  if not re.match(r"^\d{4}-\d{2}-\d{2}", ln) or ln[:10] >= cutoff]
+        kept.append(today_entry)
+        return "\n".join(kept), "", "", ""
+    return today_entry, "", "", ""
+
 def build_layer_update_prompt(report_summary: str, analyst_draft: str,
                                old_l2: str, old_l3: str, old_l4: str,
                                old_kh: str) -> str:
@@ -836,8 +868,134 @@ def fetch_layer1() -> str:
     return content[:1000] + "…" if len(content) > 1000 else content
 
 
-def parse_layer_update(raw: str, old_l2: str, old_kh: str,
-                        report_summary: str) -> tuple[str, str, str, str]:
-    raw = raw.strip()
-    raw = re.sub(r"^
-http://googleusercontent.com/immersive_entry_chip/0
+def update_knowledge_history(old_kh: str, new_topic: str) -> str:
+    if not new_topic:
+        return old_kh
+    entries = [ln.strip() for ln in old_kh.strip().split("\n") if ln.strip()] if old_kh else []
+    entries.append(f"{DATE_STR}: {new_topic}")
+    return "\n".join(entries[-10:])
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    print(f"[{DATE_STR}] Daily Intelligence Brief v8.2 — {PERIPHERY_LABEL}")
+    print(f"  Analyst/Narrator/Weekly: {MODEL_SONNET} | Layer: {MODEL_HAIKU}")
+
+    # ── 0. Market data (free APIs) ────────────────────────────────────────────
+    print("  → Market data (yfinance + FRED + Correlation Matrix)...")
+    yfd, corr_text = fetch_yfinance_data()
+    frd = fetch_fred_data()
+    market_data, hard_truths = format_market_data(yfd, frd, corr_text)
+    if market_data:
+        print(f"    ✓ yf:{len(yfd)} indicators | fred:{len(frd)} indicators | Correlation Matrix: {'✓' if corr_text else '∅'}")
+    else:
+        print("    ⚠ APIs unavailable → search 1 reverts to market data query")
+
+    # ── 1. Load memory ────────────────────────────────────────────────────────
+    print("  → Loading memory...")
+    try:
+        layer1            = fetch_layer1()
+        layer2            = read_memo(LAYER2_TITLE)
+        layer3            = read_memo(LAYER3_TITLE)
+        layer4            = read_memo(LAYER4_TITLE)
+        knowledge_history = read_memo(KNOWLEDGE_HISTORY)
+        print(f"    L1={'✓' if layer1 else '∅'}  L2={'✓' if layer2 else '∅'}  "
+              f"L3={'✓' if layer3 else '∅'}  L4={'✓' if layer4 else '∅'}  "
+              f"KH={'✓' if knowledge_history else '∅'}")
+    except Exception as e:
+        print(f"    ⚠ Memory load failed ({e})")
+        layer1 = layer2 = layer3 = layer4 = knowledge_history = ""
+
+    # ── 2. Analyst + DA (Sonnet + extended thinking, 3 searches) ──────────────
+    print("  → [Analyst+DA] Draft (Sonnet + extended thinking, 3 searches)...")
+    analyst_draft = with_retry(
+        call_claude_with_search,
+        ANALYST_SYSTEM,
+        build_analyst_prompt(layer1, layer2, layer3, layer4, knowledge_history, market_data),
+    )
+    print(f"  ✓ Draft ({len(analyst_draft)} chars)")
+    
+    # ── 2.5 Logic Guardrail (Data Consistency Check) ─────────────────────────
+    print("  → [Guardrail] Verifying macro logic...")
+    guardrail_warning = perform_logic_guardrail(analyst_draft, hard_truths)
+    if guardrail_warning:
+        print("    ⚠ Logic violation detected! Correction injected.")
+    else:
+        print("    ✓ Logic check passed.")
+
+    # ── 3. Narrator (Sonnet) ──────────────────────────────────────────────────
+    print("  → [Narrator] Final report (Sonnet)...")
+    final_report = with_retry(
+        call_claude,
+        NARRATOR_SYSTEM,
+        build_narrator_prompt(analyst_draft, guardrail_warning),
+        MODEL_SONNET,
+        max_tokens=5500,
+    )
+    print(f"  ✓ Report ({len(final_report)} chars)")
+
+    # ── 4. Push to Notion FIRST ───────────────────────────────────────────────
+    print("  → Pushing to Notion...")
+    page_id = create_page(NOTION_DB_ID, f"📊 Daily Brief | {DATE_STR}", "daily")
+    append_blocks(page_id, final_report)
+    print(f"  ✓ Pushed (page: {page_id})")
+
+    # ── 5. Update memory (Haiku) ──────────────────────────────────────────────
+    print("  → Updating memory (Haiku)...")
+    try:
+        report_summary = final_report[:1000]
+        update_raw = call_claude(
+            LAYER_UPDATE_SYSTEM,
+            build_layer_update_prompt(
+                report_summary, analyst_draft,
+                layer2, layer3, layer4, knowledge_history
+            ),
+            MODEL_HAIKU,
+            max_tokens=1200,
+        )
+        new_l2, new_l3, new_l4, new_kt = parse_layer_update(
+            update_raw, layer2, knowledge_history, report_summary
+        )
+        if new_l2:
+            safe_overwrite_memo(LAYER2_TITLE, new_l2)
+        if new_l3:
+            safe_overwrite_memo(LAYER3_TITLE, new_l3)
+        if new_l4:
+            safe_overwrite_memo(LAYER4_TITLE, new_l4)
+        updated_kh = update_knowledge_history(knowledge_history, new_kt)
+        if updated_kh:
+            safe_overwrite_memo(KNOWLEDGE_HISTORY, updated_kh)
+        print(f"  ✓ Memory (L2={'✓' if new_l2 else '∅'} "
+              f"L3={'✓' if new_l3 else '∅'} L4={'✓' if new_l4 else '∅'} "
+              f"KH={'✓' if new_kt else '∅'})")
+    except Exception as e:
+        print(f"  ⚠ Memory update failed ({e}) — report saved")
+
+    # ── 6. Weekly on Monday (Sonnet) ──────────────────────────────────────────
+    if IS_MONDAY:
+        print("  → Weekly review (Sonnet)...")
+        try:
+            fresh_l2 = read_memo(LAYER2_TITLE)
+            fresh_l3 = read_memo(LAYER3_TITLE)
+            weekly = with_retry(
+                call_claude,
+                WEEKLY_SYSTEM,
+                build_weekly_prompt(fresh_l2, fresh_l3),
+                MODEL_SONNET,
+                max_tokens=3000,
+            )
+            week_start = (TODAY - datetime.timedelta(days=6)).strftime("%Y-%m-%d")
+            w_id = create_page(
+                NOTION_WEEKLY_DB,
+                f"📅 Weekly Review | {week_start} ~ {DATE_STR}",
+                "weekly"
+            )
+            append_blocks(w_id, weekly)
+            print(f"  ✓ Weekly pushed (page: {w_id})")
+        except Exception as e:
+            print(f"  ⚠ Weekly failed ({e})")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
