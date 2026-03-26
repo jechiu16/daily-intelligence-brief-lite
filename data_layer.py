@@ -6,7 +6,9 @@ data_layer.py — Layer 0: 資料收集
 import datetime as dt
 import logging
 import json
-import io  # 新增：用來處理記憶體中的檔案讀取
+import io
+import time
+import re
 
 import pandas as pd
 import numpy as np
@@ -20,6 +22,32 @@ from config import FRED_API_KEY, EIA_API_KEY, FRED_SERIES, YFINANCE_TICKERS
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────
+# 輔助函數：帶有自動重試機制的網路請求
+# ─────────────────────────────────────────────────────────────────────
+def _safe_get(url: str, headers: dict = None, max_retries: int = 3, delay: int = 2, timeout: int = 15):
+    """
+    發送 GET 請求，若失敗則自動重試。
+    遇到 404 (找不到網頁) 則不重試直接報錯，因為重試也沒用。
+    """
+    for attempt in range(max_retries):
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp.raise_for_status()  # 如果狀態碼是 4xx 或 5xx 會觸發 HTTPError
+            return resp
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"HTTP 404 Not Found for {url}. (直接放棄)")
+                raise e
+            logger.warning(f"HTTP 錯誤 {e.response.status_code} for {url}. 準備重試 ({attempt + 1}/{max_retries})...")
+        except Exception as e:
+            logger.warning(f"連線失敗: {e} for {url}. 準備重試 ({attempt + 1}/{max_retries})...")
+        
+        if attempt < max_retries - 1:
+            time.sleep(delay)  # 休息幾秒再試
+            
+    raise Exception(f"在 {max_retries} 次嘗試後，依然無法取得 {url} 的資料。")
+
+# ─────────────────────────────────────────────────────────────────────
 # yfinance
 # ─────────────────────────────────────────────────────────────────────
 
@@ -27,7 +55,7 @@ def fetch_yfinance(lookback_days: int = 5) -> dict:
     """取得所有 ticker 的最新價格、日漲跌幅、方向。"""
     result = {}
     end = dt.date.today()
-    start = end - dt.timedelta(days=lookback_days + 5)  # 多抓幾天避免假日
+    start = end - dt.timedelta(days=lookback_days + 5)
 
     for name, ticker in YFINANCE_TICKERS.items():
         try:
@@ -37,7 +65,6 @@ def fetch_yfinance(lookback_days: int = 5) -> dict:
                 logger.warning(f"yfinance: {name} ({ticker}) 資料不足")
                 continue
 
-            # 處理 MultiIndex columns
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 
@@ -53,7 +80,6 @@ def fetch_yfinance(lookback_days: int = 5) -> dict:
         except Exception as e:
             logger.error(f"yfinance error for {name}: {e}")
 
-    # ── 衍生指標 ──
     copper_price = result.get("Copper_price")
     gold_price = result.get("Gold_price")
     if copper_price and gold_price and gold_price > 0:
@@ -93,46 +119,29 @@ def fetch_fred() -> dict:
 def compute_fred_derived(fred_data: dict) -> dict:
     """從 FRED 資料計算衍生指標。"""
     result = {}
-
-    # Fed Funds Rate
     result["fed_funds_rate"] = fred_data.get("DFF")
-
-    # Core PCE YoY
     result["core_pce_yoy"] = fred_data.get("PCEPILFE")
-
-    # Unemployment Rate
     result["unemployment_rate"] = fred_data.get("UNRATE")
 
-    # Yield Curve
     t10y2y = fred_data.get("T10Y2Y")
     result["yield_curve_value"] = t10y2y
     result["yield_curve_inverted"] = (t10y2y is not None and t10y2y < 0)
 
-    # Breakeven Inflation
     bei = fred_data.get("T10YIE")
-
-    # 5Y5Y Forward
     result["forward_5y5y"] = fred_data.get("T5YIFR")
-
-    # NFCI
     result["nfci"] = fred_data.get("NFCI")
 
-    # Real Yield = 10Y - BEI
     dgs10 = fred_data.get("DGS10")
     if dgs10 is not None and bei is not None:
         real_yield = round(dgs10 - bei, 4)
         result["real_yield_value"] = real_yield
 
-    # Real Fed Funds = Fed Funds - Core PCE
     ff = fred_data.get("DFF")
     pce = fred_data.get("PCEPILFE")
     if ff is not None and pce is not None:
         result["real_fed_funds"] = round(ff - pce, 4)
 
-    # Taylor Rule Deviation
     if ff is not None and pce is not None:
-        # 簡化版 Taylor Rule: r* + 1.5*(inflation - 2) + 0.5*(output_gap)
-        # 假設 r* = 2.5, output_gap ≈ 0 (用失業率近似)
         taylor = 2.5 + 1.5 * (pce - 2.0)
         if ff > taylor + 0.5:
             result["taylor_rule_deviation"] = "too_tight"
@@ -141,7 +150,6 @@ def compute_fred_derived(fred_data: dict) -> dict:
         else:
             result["taylor_rule_deviation"] = "neutral"
 
-    # HY-IG Spread
     hy = fred_data.get("BAMLH0A0HYM2")
     ig = fred_data.get("BAMLC0A0CM")
     if hy is not None and ig is not None:
@@ -159,23 +167,18 @@ def compute_fred_derived(fred_data: dict) -> dict:
 def fetch_liquidity(fred_data: dict) -> dict:
     """計算淨流動性 = Fed 資產 - RRP - TGA。"""
     result = {}
-
-    walcl = fred_data.get("WALCL")  # Fed Balance Sheet (millions)
-    rrp = fred_data.get("RRPONTSYD")  # RRP (billions)
+    walcl = fred_data.get("WALCL") 
+    rrp = fred_data.get("RRPONTSYD")
 
     if walcl is None or rrp is None:
         return result
 
-    # TGA from TreasuryDirect (fallback: 用固定估計)
     tga_bn = _fetch_tga()
-
-    # WALCL 是 millions, RRP 是 billions
     walcl_bn = walcl / 1000.0
-    rrp_bn = rrp  # 已經是 billions
+    rrp_bn = rrp 
 
     net_liq = round(walcl_bn - rrp_bn - tga_bn, 1)
     result["net_liquidity_bn"] = net_liq
-
     return result
 
 
@@ -186,15 +189,14 @@ def _fetch_tga() -> float:
                "/v1/accounting/dts/dts_table_1"
                "?sort=-record_date&page[size]=1"
                "&filter=account_type:eq:Treasury General Account (TGA) Closing Balance")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
+        resp = _safe_get(url)
         data = resp.json()
         if data.get("data"):
             val = float(data["data"][0]["close_today_bal"])
-            return round(val / 1_000_000, 1)  # 轉成 billions (原始單位是 millions)
+            return round(val / 1_000_000, 1) 
     except Exception as e:
         logger.warning(f"TGA fetch failed, using fallback: {e}")
-    return 750.0  # fallback 估計值
+    return 750.0  
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -207,10 +209,8 @@ def fetch_fedwatch() -> dict:
     try:
         url = "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html"
         headers = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get(url, headers=headers, timeout=15)
-        # CME 的資料通常需要更複雜的抓取方式，這裡用 Grounding 替代
-        # Analyst 會透過 Gemini Grounding 搜尋最新 FedWatch 資料
-        result["fed_next_cut_prob"] = None  # 由 Analyst Grounding 補充
+        resp = _safe_get(url, headers=headers)
+        result["fed_next_cut_prob"] = None  
         result["fed_cuts_priced_in"] = None
     except Exception as e:
         logger.warning(f"FedWatch fetch failed: {e}")
@@ -236,8 +236,7 @@ def fetch_eia() -> dict:
                f"&facets[process][]=SAE"
                f"&sort[0][column]=period&sort[0][direction]=desc"
                f"&length=2")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
+        resp = _safe_get(url)
         data = resp.json()
 
         records = data.get("response", {}).get("data", [])
@@ -259,41 +258,46 @@ def fetch_eia() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# GDPNow (Atlanta Fed)
+# GDPNow (Atlanta Fed) - 網頁爬蟲版 + 重試機制
 # ─────────────────────────────────────────────────────────────────────
 
 def fetch_gdpnow() -> dict:
-    """Atlanta Fed GDPNow 即時 GDP 估計。"""
+    """Atlanta Fed GDPNow 即時 GDP 估計 (爬取網頁文字)"""
     result = {}
     try:
-        url = "https://www.atlantafed.org/-/media/documents/cqer/researchcq/gdpnow/GDPNowForecast.xlsx"
-        # 加上偽裝成一般瀏覽器的標頭 (User-Agent)
+        url = "https://www.atlantafed.org/cqer/research/gdpnow"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
         }
-        resp = requests.get(url, headers=headers, timeout=15)
-        resp.raise_for_status() # 確定有成功抓到檔案
-
-        # 將記憶體中的二進位資料交給 pandas 解析 (加入 engine='openpyxl')
-        df = pd.read_excel(io.BytesIO(resp.content), sheet_name="Tracking", header=None, engine='openpyxl')
+        # 使用我們剛剛寫的 _safe_get，自動享有 3 次重試機會
+        resp = _safe_get(url, headers=headers)
         
-        # GDPNow 的 Excel 格式：最新預測值在特定位置
-        # 嘗試找到最新的數字
-        for i in range(len(df) - 1, -1, -1):
-            for j in range(len(df.columns) - 1, -1, -1):
-                val = df.iloc[i, j]
-                if isinstance(val, (int, float)) and not np.isnan(val) and -10 < val < 20:
-                    result["gdpnow_estimate"] = round(float(val), 2)
-                    return result
+        soup = BeautifulSoup(resp.text, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+        
+        match1 = re.search(r"(\d+\.\d+)\s*%\s*Latest GDPNow Estimate", text, re.IGNORECASE)
+        if match1:
+            result["gdpnow_estimate"] = float(match1.group(1))
+            return result
+            
+        match2 = re.search(r"estimate for real GDP growth.*?is\s+(\d+\.\d+)\s*percent", text, re.IGNORECASE)
+        if match2:
+            result["gdpnow_estimate"] = float(match2.group(1))
+            return result
+            
+        logger.warning("GDPNow HTML 抓取成功，但找不到相符的數字格式。")
     except Exception as e:
-        logger.warning(f"GDPNow fetch failed: {e}")
+        logger.warning(f"GDPNow web fetch failed: {e}")
 
-    # Fallback: 用 FRED series (如果有)
+    # Fallback: 如果網頁真的爬不到，再退回 FRED
     try:
         fred = Fred(api_key=FRED_API_KEY)
         s = fred.get_series("GDPNOW")
         if not s.empty:
             result["gdpnow_estimate"] = round(float(s.dropna().iloc[-1]), 2)
+            logger.warning("GDPNow: 使用 FRED 備用資料 (可能為上一季的落後數據)。")
     except Exception:
         pass
 
@@ -325,27 +329,22 @@ def fetch_imf() -> dict:
     """IMF 資料：美國債務/GDP、財政餘額/GDP。"""
     result = {}
 
-    # 債務/GDP
     try:
         url = ("https://www.imf.org/external/datamapper/api/v1"
                "/GGXWDG_NGDP/USA?periods=2024,2025,2026")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
+        resp = _safe_get(url)
         data = resp.json()
         values = data.get("values", {}).get("GGXWDG_NGDP", {}).get("USA", {})
-        # 取最新年份
         for year in sorted(values.keys(), reverse=True):
             result["imf_us_debt_gdp"] = round(float(values[year]), 1)
             break
     except Exception as e:
         logger.warning(f"IMF debt/GDP fetch failed: {e}")
 
-    # 財政餘額/GDP
     try:
         url = ("https://www.imf.org/external/datamapper/api/v1"
                "/GGXCNL_NGDP/USA?periods=2024,2025,2026")
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
+        resp = _safe_get(url)
         data = resp.json()
         values = data.get("values", {}).get("GGXCNL_NGDP", {}).get("USA", {})
         for year in sorted(values.keys(), reverse=True):
@@ -370,11 +369,9 @@ def fetch_oecd_cli() -> dict:
                "M.USA.LI.LOLITOAA.IXOBSA.......?lastNObservations=3"
                "&dimensionAtObservation=AllDimensions")
         headers = {"Accept": "application/json"}
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
+        resp = _safe_get(url, headers=headers)
         data = resp.json()
 
-        # 解析 SDMX JSON
         obs = data.get("dataSets", [{}])[0].get("observations", {})
         values = sorted(obs.items(), key=lambda x: x[0])
 
@@ -383,7 +380,6 @@ def fetch_oecd_cli() -> dict:
             prev_val = values[-2][1][0]
             result["oecd_cli_us"] = round(float(latest_val), 2)
 
-            # 判斷方向
             diff = latest_val - prev_val
             if latest_val > 100 and diff > 0:
                 result["oecd_cli_direction"] = "expanding"
@@ -407,12 +403,10 @@ def fetch_bis() -> dict:
     """BIS 非美美元信貸 (季頻)。"""
     result = {}
     try:
-        # BIS API: USD credit to non-bank borrowers outside US
         url = ("https://stats.bis.org/api/v2/data/dataflow/BIS/WS_GLI/1.0/"
                "Q.5A.USD.A.1C.A.A.TO1.A?lastNObservations=2")
         headers = {"Accept": "application/json"}
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
+        resp = _safe_get(url, headers=headers)
         data = resp.json()
 
         obs = data.get("dataSets", [{}])[0].get("series", {})
@@ -436,8 +430,6 @@ def fetch_bis() -> dict:
 def fetch_cot() -> dict:
     """CFTC Commitments of Traders — 極端倉位偵測。"""
     result = {"cot_crowding_flags": []}
-
-    # 主要資產的 CFTC code
     contracts = {
         "S&P 500": "13874A",
         "10Y Treasury": "043602",
@@ -447,30 +439,23 @@ def fetch_cot() -> dict:
     }
 
     try:
-        # 使用 CFTC Quandl/Nasdaq Data 替代
         year = dt.date.today().year
-        url = (f"https://www.cftc.gov/dea/newcot/deafut_txt_{year}.zip")
-        # 這個比較大，用更簡單的 API
-        # 替代方案: 用 datamapper
         for name, code in contracts.items():
             try:
                 api_url = (f"https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
                           f"?$where=cftc_contract_market_code='{code}'"
                           f"&$order=report_date_as_yyyy_mm_dd DESC"
                           f"&$limit=52")
-                resp = requests.get(api_url, timeout=15)
-                if resp.status_code != 200:
-                    continue
+                # 這裡也套用了安全重試
+                resp = _safe_get(api_url)
                 data = resp.json()
                 if len(data) < 20:
                     continue
 
-                # 計算 Net Speculative Position
                 latest = data[0]
                 net_spec = (int(latest.get("noncomm_positions_long_all", 0)) -
                            int(latest.get("noncomm_positions_short_all", 0)))
 
-                # 計算 52 週百分位
                 nets = []
                 for row in data:
                     n = (int(row.get("noncomm_positions_long_all", 0)) -
@@ -499,68 +484,43 @@ def fetch_cot() -> dict:
 def collect_all_data() -> dict:
     """收集所有 Layer 0 資料，返回統一的 dict。"""
     logger.info("開始收集資料...")
-
     data = {}
 
-    # 1. yfinance (市場價格)
     logger.info("  → yfinance")
-    yf_data = fetch_yfinance()
-    data.update(yf_data)
+    data.update(fetch_yfinance())
 
-    # 2. FRED (宏觀資料)
     logger.info("  → FRED")
     fred_raw = fetch_fred()
-    fred_derived = compute_fred_derived(fred_raw)
-    data.update(fred_derived)
-    data["_fred_raw"] = fred_raw  # 保留原始資料供其他計算使用
+    data.update(compute_fred_derived(fred_raw))
+    data["_fred_raw"] = fred_raw  
 
-    # 3. 流動性三角
     logger.info("  → 流動性")
-    liq = fetch_liquidity(fred_raw)
-    data.update(liq)
+    data.update(fetch_liquidity(fred_raw))
 
-    # 4. CME FedWatch
     logger.info("  → FedWatch")
-    fw = fetch_fedwatch()
-    data.update(fw)
+    data.update(fetch_fedwatch())
 
-    # 5. EIA
     logger.info("  → EIA")
-    eia = fetch_eia()
-    data.update(eia)
+    data.update(fetch_eia())
 
-    # 6. GDPNow
     logger.info("  → GDPNow")
-    gdp = fetch_gdpnow()
-    data.update(gdp)
+    data.update(fetch_gdpnow())
 
-    # 7. Recession Probability
     logger.info("  → Recession Prob")
-    rec = fetch_recession_prob()
-    data.update(rec)
+    data.update(fetch_recession_prob())
 
-    # 8. IMF
     logger.info("  → IMF")
-    imf = fetch_imf()
-    data.update(imf)
+    data.update(fetch_imf())
 
-    # 9. OECD CLI
     logger.info("  → OECD CLI")
-    oecd = fetch_oecd_cli()
-    data.update(oecd)
+    data.update(fetch_oecd_cli())
 
-    # 10. BIS
     logger.info("  → BIS")
-    bis = fetch_bis()
-    data.update(bis)
+    data.update(fetch_bis())
 
-    # 11. CFTC COT
     logger.info("  → CFTC COT")
-    cot = fetch_cot()
-    data.update(cot)
+    data.update(fetch_cot())
 
-    # 移除內部用的原始資料
     data.pop("_fred_raw", None)
-
     logger.info("資料收集完成")
     return data
