@@ -118,3 +118,44 @@ Regime: {regime}
     "statement": "因為財政赤字無法收斂，所以長天期債券存在被拋售風險..."
   }}
 ]
+```
+
+## 8. L2 更新建議 (市場結構更新)
+總結當前的宏觀體制狀態。
+⚠️ 必須嚴格使用以下格式逐行輸出（不可使用項目符號、不可加粗體）：
+regime: {regime}
+driver: [填入主要推動當前市場的因素]
+policy: [填入目前貨幣與財政政策狀態]
+fragility: [填入當前市場最脆弱的環節]
+"""
+
+
+def run_analyst(prompt):
+    logger.info("Running Analyst (Gemini 2.5 Pro)...")
+    try:
+        response = client.models.generate_content(
+            model=MODEL_ANALYST,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.7,
+                max_output_tokens=12000,
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=12000
+                ),
+                tools=[types.Tool(google_search=types.GoogleSearch())],
+            ),
+        )
+
+        text_parts = []
+        for part in response.candidates[0].content.parts:
+            if hasattr(part, "text") and part.text:
+                if not getattr(part, "thought", False):
+                    text_parts.append(part.text)
+
+        result = "\n".join(text_parts)
+        logger.info(f"Analyst output: {len(result)} chars")
+        return result
+
+    except Exception as e:
+        logger.error(f"Analyst error: {e}")
+        raise
