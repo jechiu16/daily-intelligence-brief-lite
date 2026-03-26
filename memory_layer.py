@@ -1,6 +1,6 @@
 """
 memory_layer.py — 記憶層 (L1-L4, KH) via Notion REST API
-直接用 httpx 呼叫 Notion API，不依賴 notion-client SDK 版本。
+支援 Notion 原生格式（heading, paragraph, bullet）和 database property。
 """
 
 import datetime
@@ -24,21 +24,195 @@ NOTION_HEADERS = {
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Markdown → Notion Blocks 轉換器
+# ─────────────────────────────────────────────────────────────────────
+
+def _markdown_to_rich_text(text: str) -> list:
+    """將 markdown inline 格式轉成 Notion rich_text array。
+    支援 **粗體** 和普通文字。"""
+    parts = []
+    pattern = r'\*\*(.+?)\*\*'
+    last_end = 0
+
+    for match in re.finditer(pattern, text):
+        # 粗體前的普通文字
+        if match.start() > last_end:
+            plain = text[last_end:match.start()]
+            if plain:
+                parts.append({"type": "text", "text": {"content": plain}})
+        # 粗體文字
+        parts.append({
+            "type": "text",
+            "text": {"content": match.group(1)},
+            "annotations": {"bold": True}
+        })
+        last_end = match.end()
+
+    # 剩餘普通文字
+    if last_end < len(text):
+        remaining = text[last_end:]
+        if remaining:
+            parts.append({"type": "text", "text": {"content": remaining}})
+
+    return parts if parts else [{"type": "text", "text": {"content": text}}]
+
+
+def _markdown_to_blocks(markdown: str) -> list:
+    """將 markdown 文字轉成 Notion block array。"""
+    blocks = []
+    lines = markdown.split("\n")
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # 空行跳過
+        if not stripped:
+            i += 1
+            continue
+
+        # --- 分隔線
+        if re.match(r'^-{3,}$', stripped):
+            blocks.append({"object": "block", "type": "divider", "divider": {}})
+            i += 1
+            continue
+
+        # # H1
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            text = stripped[2:].strip()
+            blocks.append({
+                "object": "block",
+                "type": "heading_1",
+                "heading_1": {"rich_text": _markdown_to_rich_text(text)}
+            })
+            i += 1
+            continue
+
+        # ## H2
+        if stripped.startswith("## "):
+            text = stripped[3:].strip()
+            blocks.append({
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {"rich_text": _markdown_to_rich_text(text)}
+            })
+            i += 1
+            continue
+
+        # ### H3
+        if stripped.startswith("### "):
+            text = stripped[4:].strip()
+            blocks.append({
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": _markdown_to_rich_text(text)}
+            })
+            i += 1
+            continue
+
+        # - bullet list 或 * bullet list
+        if re.match(r'^[-*]\s+', stripped):
+            text = re.sub(r'^[-*]\s+', '', stripped)
+            blocks.append({
+                "object": "block",
+                "type": "bulleted_list_item",
+                "bulleted_list_item": {"rich_text": _markdown_to_rich_text(text)}
+            })
+            i += 1
+            continue
+
+        # 1. numbered list
+        if re.match(r'^\d+\.\s+', stripped):
+            text = re.sub(r'^\d+\.\s+', '', stripped)
+            blocks.append({
+                "object": "block",
+                "type": "numbered_list_item",
+                "numbered_list_item": {"rich_text": _markdown_to_rich_text(text)}
+            })
+            i += 1
+            continue
+
+        # > quote / callout
+        if stripped.startswith("> "):
+            text = stripped[2:].strip()
+            blocks.append({
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": _markdown_to_rich_text(text),
+                    "icon": {"type": "emoji", "emoji": "💡"}
+                }
+            })
+            i += 1
+            continue
+
+        # 📋 特殊結尾 → callout
+        if stripped.startswith("📋"):
+            # 收集這段和下面幾行
+            callout_lines = [stripped]
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                callout_lines.append(lines[i].strip())
+                i += 1
+            blocks.append({
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": _markdown_to_rich_text("\n".join(callout_lines)),
+                    "icon": {"type": "emoji", "emoji": "📋"}
+                }
+            })
+            continue
+
+        # 普通段落 — 收集連續非空行
+        para_lines = [stripped]
+        i += 1
+        while i < len(lines):
+            next_stripped = lines[i].strip()
+            if (not next_stripped or next_stripped.startswith("#") or
+                next_stripped.startswith("- ") or next_stripped.startswith("* ") or
+                re.match(r'^\d+\.\s+', next_stripped) or
+                next_stripped.startswith("> ") or next_stripped.startswith("📋") or
+                re.match(r'^-{3,}$', next_stripped)):
+                break
+            para_lines.append(next_stripped)
+            i += 1
+
+        text = "\n".join(para_lines)
+        # Notion rich_text 單段上限 2000 字
+        if len(text) > 1900:
+            for chunk_start in range(0, len(text), 1900):
+                chunk = text[chunk_start:chunk_start + 1900]
+                blocks.append({
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": _markdown_to_rich_text(chunk)}
+                })
+        else:
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": _markdown_to_rich_text(text)}
+            })
+
+    # Notion 限制：children 最多 100 個 block
+    return blocks[:100] if blocks else [
+        {"object": "block", "type": "paragraph",
+         "paragraph": {"rich_text": [{"type": "text", "text": {"content": ""}}]}}
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Notion REST API 工具函數
 # ─────────────────────────────────────────────────────────────────────
 
 def _find_page_by_title(title: str) -> Optional[str]:
-    """在 database 中找到指定 title 的 page，返回 page_id。"""
     try:
         resp = httpx.post(
             f"{NOTION_API}/databases/{NOTION_DATABASE_ID}/query",
             headers=NOTION_HEADERS,
-            json={
-                "filter": {
-                    "property": "title",
-                    "title": {"equals": title}
-                }
-            },
+            json={"filter": {"property": "Name", "title": {"equals": title}}},
             timeout=30,
         )
         resp.raise_for_status()
@@ -51,7 +225,6 @@ def _find_page_by_title(title: str) -> Optional[str]:
 
 
 def _get_page_content(page_id: str) -> str:
-    """取得 page 的純文字內容。"""
     try:
         resp = httpx.get(
             f"{NOTION_API}/blocks/{page_id}/children",
@@ -64,14 +237,9 @@ def _get_page_content(page_id: str) -> str:
         text_parts = []
         for block in blocks:
             block_type = block["type"]
-            if block_type in ("paragraph", "heading_1", "heading_2", "heading_3",
-                             "bulleted_list_item", "numbered_list_item"):
-                rich_texts = block[block_type].get("rich_text", [])
-                text = "".join(rt["plain_text"] for rt in rich_texts)
-                text_parts.append(text)
-            elif block_type == "code":
-                rich_texts = block["code"].get("rich_text", [])
-                text = "".join(rt["plain_text"] for rt in rich_texts)
+            rich_text_key = block.get(block_type, {})
+            if "rich_text" in rich_text_key:
+                text = "".join(rt["plain_text"] for rt in rich_text_key["rich_text"])
                 text_parts.append(text)
         return "\n".join(text_parts)
     except Exception as e:
@@ -79,38 +247,26 @@ def _get_page_content(page_id: str) -> str:
         return ""
 
 
-def _split_to_blocks(content: str, max_chars: int = 1800) -> list[dict]:
-    """將內容切成多個 block，每個不超過 max_chars。"""
-    chunks = []
-    while content:
-        chunk = content[:max_chars]
-        content = content[max_chars:]
-        chunks.append({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"text": {"content": chunk}}]
-            }
-        })
-    return chunks if chunks else [{"object": "block", "type": "paragraph",
-                                    "paragraph": {"rich_text": [{"text": {"content": ""}}]}}]
-
-
-def _create_page(title: str, content: str) -> Optional[str]:
-    """在 database 中建立新 page。"""
+def _create_page_simple(title: str, content: str) -> Optional[str]:
+    """建立簡單頁面（記憶層用，純文字）。"""
     try:
-        children = _split_to_blocks(content)
+        blocks = []
+        for chunk_start in range(0, max(len(content), 1), 1900):
+            chunk = content[chunk_start:chunk_start + 1900]
+            blocks.append({
+                "object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk}}]}
+            })
+
         resp = httpx.post(
             f"{NOTION_API}/pages",
             headers=NOTION_HEADERS,
             json={
                 "parent": {"database_id": NOTION_DATABASE_ID},
                 "properties": {
-                    "title": {
-                        "title": [{"text": {"content": title}}]
-                    }
+                    "Name": {"title": [{"text": {"content": title}}]}
                 },
-                "children": children
+                "children": blocks[:100]
             },
             timeout=30,
         )
@@ -122,31 +278,32 @@ def _create_page(title: str, content: str) -> Optional[str]:
 
 
 def _update_page_content(page_id: str, content: str):
-    """更新 page 內容（刪除舊 blocks，寫入新 block）。"""
+    """更新頁面內容（記憶層用，純文字）。"""
     try:
         resp = httpx.get(
             f"{NOTION_API}/blocks/{page_id}/children",
-            headers=NOTION_HEADERS,
-            timeout=30,
+            headers=NOTION_HEADERS, timeout=30,
         )
         resp.raise_for_status()
-        old_blocks = resp.json().get("results", [])
-
-        for block in old_blocks:
+        for block in resp.json().get("results", []):
             try:
-                httpx.delete(
-                    f"{NOTION_API}/blocks/{block['id']}",
-                    headers=NOTION_HEADERS,
-                    timeout=15,
-                )
+                httpx.delete(f"{NOTION_API}/blocks/{block['id']}",
+                             headers=NOTION_HEADERS, timeout=15)
             except Exception:
                 pass
 
-        children = _split_to_blocks(content)
+        blocks = []
+        for chunk_start in range(0, max(len(content), 1), 1900):
+            chunk = content[chunk_start:chunk_start + 1900]
+            blocks.append({
+                "object": "block", "type": "paragraph",
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk}}]}
+            })
+
         httpx.patch(
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
-            json={"children": children},
+            json={"children": blocks[:100]},
             timeout=30,
         )
     except Exception as e:
@@ -167,8 +324,6 @@ def strip_report_formatting(text: str, max_chars: int = 2000) -> str:
             continue
         if re.match(r"^-{3,}$", s):
             continue
-        if re.match(r"^\*\*\d{4}年", s):
-            continue
         if s.startswith("📋"):
             break
         lines.append(s)
@@ -185,7 +340,7 @@ def fetch_layer1(yesterday_report: Optional[str] = None) -> dict:
 
     if not yesterday_report:
         yesterday = datetime.date.today() - datetime.timedelta(days=1)
-        title = f"DIB_{yesterday.isoformat()}"
+        title = f"Daily Brief | {yesterday.isoformat()}"
         page_id = _find_page_by_title(title)
         if page_id:
             yesterday_report = _get_page_content(page_id)
@@ -219,7 +374,7 @@ def fetch_layer1(yesterday_report: Optional[str] = None) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# L2-L4, KH
+# L2-L4, KH（記憶層，用簡單格式）
 # ─────────────────────────────────────────────────────────────────────
 
 def fetch_layer2() -> str:
@@ -229,12 +384,9 @@ def fetch_layer2() -> str:
     return ""
 
 
-def update_layer2(date: str, regime: str, driver: str,
-                  policy: str, fragility: str):
+def update_layer2(date, regime, driver, policy, fragility):
     page_id = _find_page_by_title(NOTION_PAGES["L2"])
-    existing = ""
-    if page_id:
-        existing = _get_page_content(page_id)
+    existing = _get_page_content(page_id) if page_id else ""
 
     new_entry = f"{date}\nregime: {regime}\ndriver: {driver}\npolicy: {policy}\nfragility: {fragility}"
     entries = existing.strip().split("\n\n") if existing.strip() else []
@@ -246,7 +398,7 @@ def update_layer2(date: str, regime: str, driver: str,
     if page_id:
         _update_page_content(page_id, content)
     else:
-        _create_page(NOTION_PAGES["L2"], content)
+        _create_page_simple(NOTION_PAGES["L2"], content)
 
 
 def fetch_layer3() -> list[dict]:
@@ -258,48 +410,39 @@ def fetch_layer3() -> list[dict]:
         return []
     try:
         theses = json.loads(content)
-        if isinstance(theses, list):
-            return [t for t in theses if t.get("status") == "active"]
-        return []
+        return [t for t in theses if t.get("status") == "active"] if isinstance(theses, list) else []
     except json.JSONDecodeError:
         return []
 
 
-def update_layer3(theses: list[dict]):
+def update_layer3(theses):
     page_id = _find_page_by_title(NOTION_PAGES["L3"])
     content = json.dumps(theses, ensure_ascii=False, indent=2)
     if page_id:
         _update_page_content(page_id, content)
     else:
-        _create_page(NOTION_PAGES["L3"], content)
+        _create_page_simple(NOTION_PAGES["L3"], content)
 
 
 def fetch_layer4() -> str:
     page_id = _find_page_by_title(NOTION_PAGES["L4"])
-    if page_id:
-        return _get_page_content(page_id)
-    return ""
+    return _get_page_content(page_id) if page_id else ""
 
 
-def update_layer4(date: str, attack_type: str, content: str):
+def update_layer4(date, attack_type, content):
     page_id = _find_page_by_title(NOTION_PAGES["L4"])
-    existing = ""
-    if page_id:
-        existing = _get_page_content(page_id)
+    existing = _get_page_content(page_id) if page_id else ""
 
-    new_entry = json.dumps({
-        "date": date, "type": attack_type, "content": content
-    }, ensure_ascii=False)
+    new_entry = json.dumps({"date": date, "type": attack_type, "content": content}, ensure_ascii=False)
     entries = existing.strip().split("\n") if existing.strip() else []
     entries.append(new_entry)
     if len(entries) > 14:
         entries = entries[-14:]
-    content_str = "\n".join(entries)
 
     if page_id:
-        _update_page_content(page_id, content_str)
+        _update_page_content(page_id, "\n".join(entries))
     else:
-        _create_page(NOTION_PAGES["L4"], content_str)
+        _create_page_simple(NOTION_PAGES["L4"], "\n".join(entries))
 
 
 def fetch_knowledge_history() -> list[dict]:
@@ -311,14 +454,12 @@ def fetch_knowledge_history() -> list[dict]:
         return []
     try:
         history = json.loads(content)
-        if isinstance(history, list):
-            return history[-20:]
-        return []
+        return history[-20:] if isinstance(history, list) else []
     except json.JSONDecodeError:
         return []
 
 
-def update_knowledge_history(term: str, date: str):
+def update_knowledge_history(term, date):
     history = fetch_knowledge_history()
     history.append({"term": term, "date": date})
     if len(history) > 20:
@@ -329,18 +470,107 @@ def update_knowledge_history(term: str, date: str):
     if page_id:
         _update_page_content(page_id, content)
     else:
-        _create_page(NOTION_PAGES["KH"], content)
+        _create_page_simple(NOTION_PAGES["KH"], content)
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 儲存今日報告
+# 儲存今日報告（Markdown → Notion 原生格式 + property 分類）
 # ─────────────────────────────────────────────────────────────────────
 
-def save_daily_report(date: str, report: str):
-    title = f"DIB_{date}"
+def save_daily_report(date: str, report: str,
+                      regime: str = "", periphery: str = ""):
+    """將報告存到 Notion，使用原生格式和 database property。"""
+    title = f"Daily Brief | {date}"
     page_id = _find_page_by_title(title)
+
+    # 建構 properties
+    properties = {
+        "Name": {"title": [{"text": {"content": title}}]},
+    }
+
+    # Date property（如果 database 有這個欄位）
+    try:
+        properties["Date"] = {"date": {"start": date}}
+    except Exception:
+        pass
+
+    # 嘗試設定 select properties（如果 database 有這些欄位）
+    if regime:
+        properties["Regime"] = {"select": {"name": regime}}
+    properties["Type"] = {"select": {"name": "Daily"}}
+    if periphery:
+        properties["Periphery"] = {"rich_text": [{"text": {"content": periphery}}]}
+
+    # 轉換 Markdown → Notion blocks
+    children = _markdown_to_blocks(report)
+
     if page_id:
-        _update_page_content(page_id, report)
+        # 更新現有頁面
+        try:
+            # 更新 properties
+            httpx.patch(
+                f"{NOTION_API}/pages/{page_id}",
+                headers=NOTION_HEADERS,
+                json={"properties": properties},
+                timeout=30,
+            )
+            # 刪除舊 blocks
+            resp = httpx.get(f"{NOTION_API}/blocks/{page_id}/children",
+                             headers=NOTION_HEADERS, timeout=30)
+            resp.raise_for_status()
+            for block in resp.json().get("results", []):
+                try:
+                    httpx.delete(f"{NOTION_API}/blocks/{block['id']}",
+                                 headers=NOTION_HEADERS, timeout=15)
+                except Exception:
+                    pass
+            # 寫入新 blocks
+            httpx.patch(
+                f"{NOTION_API}/blocks/{page_id}/children",
+                headers=NOTION_HEADERS,
+                json={"children": children},
+                timeout=30,
+            )
+        except Exception as e:
+            logger.error(f"Notion update report error: {e}")
     else:
-        _create_page(title, report)
+        # 建立新頁面
+        try:
+            resp = httpx.post(
+                f"{NOTION_API}/pages",
+                headers=NOTION_HEADERS,
+                json={
+                    "parent": {"database_id": NOTION_DATABASE_ID},
+                    "properties": properties,
+                    "children": children,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            logger.info(f"Report created in Notion: {title}")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Notion create report error: {e}")
+            logger.error(f"Response: {e.response.text}")
+            # Fallback: 如果 property 欄位不存在，用最小 properties 重試
+            try:
+                fallback_props = {
+                    "Name": {"title": [{"text": {"content": title}}]}
+                }
+                resp = httpx.post(
+                    f"{NOTION_API}/pages",
+                    headers=NOTION_HEADERS,
+                    json={
+                        "parent": {"database_id": NOTION_DATABASE_ID},
+                        "properties": fallback_props,
+                        "children": children,
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                logger.info(f"Report created (fallback) in Notion: {title}")
+            except Exception as e2:
+                logger.error(f"Notion fallback create also failed: {e2}")
+        except Exception as e:
+            logger.error(f"Notion create report error: {e}")
+
     logger.info(f"Report saved to Notion: {title}")
