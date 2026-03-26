@@ -8,16 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API Keys ──────────────────────────────────────────────────────────
-GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
-FRED_API_KEY = os.environ["FRED_API_KEY"]
-EIA_API_KEY = os.environ.get("EIA_API_KEY", "")  # 可選，需申請
-NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DATABASE_ID = os.environ["NOTION_DATABASE_ID"]
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
+EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
+NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
+NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 
-# ── Gemini 模型 ──────────────────────────────────────────────────────
-MODEL_ANALYST = "gemini-2.5-pro-preview-05-06"       # Analyst: 主推理
-MODEL_FLASH = "gemini-2.5-flash-preview-04-17"       # Logic Guardrail + Layer Update
-MODEL_NARRATOR = "gemini-2.0-flash-lite"             # Narrator: 白話轉譯
+# ── Gemini 模型（2026-03 可用名稱）────────────────────────────────────
+MODEL_ANALYST = "gemini-2.5-pro"               # Analyst: 主推理 + thinking
+MODEL_FLASH = "gemini-2.5-flash"               # Logic Guardrail + Layer Update
+MODEL_NARRATOR = "gemini-2.5-flash-lite"       # Narrator: 白話轉譯
 
 # ── FRED Series ──────────────────────────────────────────────────────
 FRED_SERIES = {
