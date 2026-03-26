@@ -316,3 +316,243 @@ def fetch_recession_prob() -> dict:
 def fetch_imf() -> dict:
     """IMF 資料：美國債務/GDP、財政餘額/GDP。"""
     result = {}
+
+    # 債務/GDP
+    try:
+        url = ("https://www.imf.org/external/datamapper/api/v1"
+               "/GGXWDG_NGDP/USA?periods=2024,2025,2026")
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        values = data.get("values", {}).get("GGXWDG_NGDP", {}).get("USA", {})
+        # 取最新年份
+        for year in sorted(values.keys(), reverse=True):
+            result["imf_us_debt_gdp"] = round(float(values[year]), 1)
+            break
+    except Exception as e:
+        logger.warning(f"IMF debt/GDP fetch failed: {e}")
+
+    # 財政餘額/GDP
+    try:
+        url = ("https://www.imf.org/external/datamapper/api/v1"
+               "/GGXCNL_NGDP/USA?periods=2024,2025,2026")
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        values = data.get("values", {}).get("GGXCNL_NGDP", {}).get("USA", {})
+        for year in sorted(values.keys(), reverse=True):
+            result["imf_us_fiscal_balance"] = round(float(values[year]), 1)
+            break
+    except Exception as e:
+        logger.warning(f"IMF fiscal balance fetch failed: {e}")
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# OECD CLI
+# ─────────────────────────────────────────────────────────────────────
+
+def fetch_oecd_cli() -> dict:
+    """OECD 綜合領先指標 (CLI)。"""
+    result = {}
+    try:
+        url = ("https://sdmx.oecd.org/public/rest/data/"
+               "OECD.SDD.STES,DSD_KEI@DF_KEI,4.0/"
+               "M.USA.LI.LOLITOAA.IXOBSA.......?lastNObservations=3"
+               "&dimensionAtObservation=AllDimensions")
+        headers = {"Accept": "application/json"}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # 解析 SDMX JSON
+        obs = data.get("dataSets", [{}])[0].get("observations", {})
+        values = sorted(obs.items(), key=lambda x: x[0])
+
+        if len(values) >= 2:
+            latest_val = values[-1][1][0]
+            prev_val = values[-2][1][0]
+            result["oecd_cli_us"] = round(float(latest_val), 2)
+
+            # 判斷方向
+            diff = latest_val - prev_val
+            if latest_val > 100 and diff > 0:
+                result["oecd_cli_direction"] = "expanding"
+            elif latest_val > 100 and diff <= 0:
+                result["oecd_cli_direction"] = "slowing"
+            elif latest_val <= 100 and diff < 0:
+                result["oecd_cli_direction"] = "contracting"
+            else:
+                result["oecd_cli_direction"] = "recovering"
+    except Exception as e:
+        logger.warning(f"OECD CLI fetch failed: {e}")
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# BIS (非美美元信貸)
+# ─────────────────────────────────────────────────────────────────────
+
+def fetch_bis() -> dict:
+    """BIS 非美美元信貸 (季頻)。"""
+    result = {}
+    try:
+        # BIS API: USD credit to non-bank borrowers outside US
+        url = ("https://stats.bis.org/api/v2/data/dataflow/BIS/WS_GLI/1.0/"
+               "Q.5A.USD.A.1C.A.A.TO1.A?lastNObservations=2")
+        headers = {"Accept": "application/json"}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        obs = data.get("dataSets", [{}])[0].get("series", {})
+        for key, series_data in obs.items():
+            observations = series_data.get("observations", {})
+            latest_key = max(observations.keys())
+            result["bis_usd_credit_nonbank"] = round(
+                float(observations[latest_key][0]), 1
+            )
+            break
+    except Exception as e:
+        logger.warning(f"BIS fetch failed: {e}")
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CFTC COT (期貨倉位)
+# ─────────────────────────────────────────────────────────────────────
+
+def fetch_cot() -> dict:
+    """CFTC Commitments of Traders — 極端倉位偵測。"""
+    result = {"cot_crowding_flags": []}
+
+    # 主要資產的 CFTC code
+    contracts = {
+        "S&P 500": "13874A",
+        "10Y Treasury": "043602",
+        "Gold": "088691",
+        "Crude Oil": "067651",
+        "US Dollar Index": "098662",
+    }
+
+    try:
+        # 使用 CFTC Quandl/Nasdaq Data 替代
+        year = dt.date.today().year
+        url = (f"https://www.cftc.gov/dea/newcot/deafut_txt_{year}.zip")
+        # 這個比較大，用更簡單的 API
+        # 替代方案: 用 datamapper
+        for name, code in contracts.items():
+            try:
+                api_url = (f"https://publicreporting.cftc.gov/resource/jun7-fc8e.json"
+                          f"?$where=cftc_contract_market_code='{code}'"
+                          f"&$order=report_date_as_yyyy_mm_dd DESC"
+                          f"&$limit=52")
+                resp = requests.get(api_url, timeout=15)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                if len(data) < 20:
+                    continue
+
+                # 計算 Net Speculative Position
+                latest = data[0]
+                net_spec = (int(latest.get("noncomm_positions_long_all", 0)) -
+                           int(latest.get("noncomm_positions_short_all", 0)))
+
+                # 計算 52 週百分位
+                nets = []
+                for row in data:
+                    n = (int(row.get("noncomm_positions_long_all", 0)) -
+                         int(row.get("noncomm_positions_short_all", 0)))
+                    nets.append(n)
+
+                if nets:
+                    pctile = sum(1 for x in nets if x <= net_spec) / len(nets)
+                    if pctile > 0.9 or pctile < 0.1:
+                        result["cot_crowding_flags"].append(
+                            f"{name}({'極端多' if pctile > 0.9 else '極端空'})"
+                        )
+            except Exception:
+                continue
+
+    except Exception as e:
+        logger.warning(f"COT fetch failed: {e}")
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# 主收集函數
+# ─────────────────────────────────────────────────────────────────────
+
+def collect_all_data() -> dict:
+    """收集所有 Layer 0 資料，返回統一的 dict。"""
+    logger.info("開始收集資料...")
+
+    data = {}
+
+    # 1. yfinance (市場價格)
+    logger.info("  → yfinance")
+    yf_data = fetch_yfinance()
+    data.update(yf_data)
+
+    # 2. FRED (宏觀資料)
+    logger.info("  → FRED")
+    fred_raw = fetch_fred()
+    fred_derived = compute_fred_derived(fred_raw)
+    data.update(fred_derived)
+    data["_fred_raw"] = fred_raw  # 保留原始資料供其他計算使用
+
+    # 3. 流動性三角
+    logger.info("  → 流動性")
+    liq = fetch_liquidity(fred_raw)
+    data.update(liq)
+
+    # 4. CME FedWatch
+    logger.info("  → FedWatch")
+    fw = fetch_fedwatch()
+    data.update(fw)
+
+    # 5. EIA
+    logger.info("  → EIA")
+    eia = fetch_eia()
+    data.update(eia)
+
+    # 6. GDPNow
+    logger.info("  → GDPNow")
+    gdp = fetch_gdpnow()
+    data.update(gdp)
+
+    # 7. Recession Probability
+    logger.info("  → Recession Prob")
+    rec = fetch_recession_prob()
+    data.update(rec)
+
+    # 8. IMF
+    logger.info("  → IMF")
+    imf = fetch_imf()
+    data.update(imf)
+
+    # 9. OECD CLI
+    logger.info("  → OECD CLI")
+    oecd = fetch_oecd_cli()
+    data.update(oecd)
+
+    # 10. BIS
+    logger.info("  → BIS")
+    bis = fetch_bis()
+    data.update(bis)
+
+    # 11. CFTC COT
+    logger.info("  → CFTC COT")
+    cot = fetch_cot()
+    data.update(cot)
+
+    # 移除內部用的原始資料
+    data.pop("_fred_raw", None)
+
+    logger.info("資料收集完成")
+    return data
