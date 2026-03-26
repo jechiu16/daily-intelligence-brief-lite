@@ -63,9 +63,8 @@ def run_daily_pipeline(manual_date: str | None = None) -> str:
     l3 = fetch_layer3()
     kh = fetch_knowledge_history()
 
-    # ── Step 5: Analyst ───────────────────────────────────────────
-    logger.info("Step 5: Analyst")
-    analyst_prompt = build_analyst_prompt(
+    # ── Step 5 & 6: Analyst & Logic Guardrail (具備重試與阻斷機制) ─
+    base_analyst_prompt = build_analyst_prompt(
         level_a=level_a,
         level_b=level_b,
         relational_flags=relational_flags,
@@ -78,18 +77,39 @@ def run_daily_pipeline(manual_date: str | None = None) -> str:
         periphery_label=periphery_label,
         periphery_keywords=periphery_keywords,
     )
-    analyst_draft = run_analyst(analyst_prompt)
+    
+    current_prompt = base_analyst_prompt
+    max_retries = 2
+    attempt = 0
+    passed = False
+    analyst_draft = ""
 
-    # ── Step 6: Logic Guardrail ───────────────────────────────────
-    logger.info("Step 6: Logic Guardrail")
-    passed, guardrail_message = run_logic_guardrail(analyst_draft, hard_truths)
+    while attempt <= max_retries:
+        logger.info(f"Step 5: Analyst (嘗試次數 {attempt + 1}/{max_retries + 1})")
+        analyst_draft = run_analyst(current_prompt)
 
-    if not passed:
-        logger.warning(f"Logic Guardrail failed:\n{guardrail_message}")
-        # 將校驗結果追加到草稿，讓 Analyst 注意
-        analyst_draft += f"\n\n⚠️ LOGIC GUARDRAIL CORRECTIONS:\n{guardrail_message}"
-        # 在 v9-lite 中，我們不重跑 Analyst，但在草稿中標記問題
-        # 未來可以加入重跑邏輯
+        logger.info(f"Step 6: Logic Guardrail (嘗試次數 {attempt + 1}/{max_retries + 1})")
+        passed, guardrail_message = run_logic_guardrail(analyst_draft, hard_truths)
+
+        if passed:
+            logger.info("Logic Guardrail 驗證通過！")
+            break
+        else:
+            logger.warning(f"Logic Guardrail 發現問題 (嘗試 {attempt + 1}):\n{guardrail_message}")
+            attempt += 1
+            if attempt <= max_retries:
+                logger.info("將錯誤反饋給 Analyst，準備重新生成草稿...")
+                # 將護欄的警告加到 Prompt 的最後，要求 AI 修正
+                current_prompt = base_analyst_prompt + (
+                    f"\n\n⚠️ 【重要修正要求】\n"
+                    f"你前一次生成的草稿未能通過邏輯校驗，因為與原始數據(hard_truths)產生矛盾。\n"
+                    f"請仔細閱讀以下錯誤報告，並重新生成一份**完全符合數據事實**的草稿：\n"
+                    f"{guardrail_message}"
+                )
+            else:
+                logger.error("已達最大重試次數，Logic Guardrail 依然不通過，強制終止 Pipeline。")
+                # 強制拋出錯誤，觸發 main.py 的 sys.exit(1)，阻斷發布
+                raise ValueError(f"Pipeline 強制終止：Analyst 連續 {max_retries + 1} 次未能通過邏輯校驗。\n最後一次錯誤原因：\n{guardrail_message}")
 
     # ── Step 7: Narrator ──────────────────────────────────────────
     logger.info("Step 7: Narrator")
