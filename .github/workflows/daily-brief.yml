@@ -1,0 +1,53 @@
+name: Daily Intelligence Brief
+
+on:
+  schedule:
+    - cron: '0 23 * * 0-4'
+  workflow_dispatch:
+    inputs:
+      command:
+        description: '執行命令'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - weekly
+          - test-data
+          - test-regime
+      date:
+        description: '指定日期 (YYYY-MM-DD)，留空=今天'
+        required: false
+        type: string
+
+jobs:
+  run-brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Brief
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: |
+          COMMAND="${{ github.event.inputs.command || 'daily' }}"
+          DATE_ARG=""
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            DATE_ARG="--date ${{ github.event.inputs.date }}"
+          fi
+          python main.py $COMMAND $DATE_ARG
