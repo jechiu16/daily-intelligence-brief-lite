@@ -50,6 +50,7 @@ def build_analyst_prompt(
             l3_block += f"  - {t['name']}: {t['statement']} (confidence={t.get('confidence', '?')})\n"
 
     kh_block = ""
+    used_terms = []
     if kh:
         used_terms = [item["term"] for item in kh]
         kh_block = f"\nKH（已用過的術語，避免重複）：{', '.join(used_terms)}\n"
@@ -79,7 +80,8 @@ Regime: {regime}
 → 請搜尋這個地區的最新動態，寫入邊陲段落。
 
 ══════════════════════════════════════════════════
-請產出以下結構化草稿（繁體中文）：
+請產出以下結構化草稿（繁體中文）。
+⚠️ 警告：為了系統寫入資料庫，請【嚴格遵守】以下各區塊的標題與格式，切勿擅自更改！
 
 ## 1. 今天最重要的一件事
 一句話概括。
@@ -91,50 +93,28 @@ Regime: {regime}
 分三類：持有股票的人 / 持有債券或定存的人 / 持有外幣的人
 每類標記：🔴需要關注 / 🟡保持觀察 / 🟢目前穩定
 
-## 4. 結構化攻擊
-選擇 regime_misclassification 或 second_order_inversion 執行。
-格式：攻擊類型 / 攻擊內容 / 反面訊號
+## 4. 結構化攻擊 (L4 更新)
+選擇 regime_misclassification, second_order_inversion, reflexivity_break, omitted_variable_bias 之一執行。
+⚠️ 必須嚴格使用以下格式（不要加 Markdown 粗體星號）：
+攻擊類型：[填入上述四種之一]
+攻擊內容：[填入具體的邏輯推演與市場盲點，500字以內]
+反面訊號：[填入能證明此攻擊成立的市場訊號]
 
-## 5. 今日術語建議
-不在 KH 已用列表中、今天有用到、可以用日常比喻解釋。
+## 5. 今日術語建議 (KH 更新)
+挑選一個今天報告中用到、可以用日常比喻解釋的專業術語（絕對不能是已用列表中的詞彙）。
+⚠️ 必須嚴格使用以下格式：
+今日術語：[填入單一名詞]
 
 ## 6. 邊陲段落：{periphery_label}
 在哪、多少人、正在發生什麼、跟市場有沒有關係。
 
-## 7. Thesis 更新
-現有 thesis 更新 + 新 thesis（JSON 格式）
-
-## 8. L2 更新建議
-regime / driver / policy / fragility
-"""
-
-
-def run_analyst(prompt):
-    logger.info("Running Analyst (Gemini 2.5 Pro)...")
-    try:
-        response = client.models.generate_content(
-            model=MODEL_ANALYST,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=12000,
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=12000
-                ),
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
-        )
-
-        text_parts = []
-        for part in response.candidates[0].content.parts:
-            if hasattr(part, "text") and part.text:
-                if not getattr(part, "thought", False):
-                    text_parts.append(part.text)
-
-        result = "\n".join(text_parts)
-        logger.info(f"Analyst output: {len(result)} chars")
-        return result
-
-    except Exception as e:
-        logger.error(f"Analyst error: {e}")
-        raise
+## 7. Thesis 更新 (L3 更新)
+基於今日市場動態，產出 1~2 個全新的投資論點。
+⚠️ 必須嚴格使用 Markdown JSON 陣列格式，且只包含 name 和 statement 欄位，例如：
+```json
+[
+  {{
+    "name": "US_Fiscal_Dominance_Trade",
+    "statement": "因為財政赤字無法收斂，所以長天期債券存在被拋售風險..."
+  }}
+]
