@@ -102,7 +102,8 @@ def run_daily_pipeline(manual_date: str | None = None) -> str:
 
     # ── Step 8: 儲存報告 ──────────────────────────────────────────
     logger.info("Step 8: 儲存報告")
-    save_daily_report(today, final_report)
+    save_daily_report(today, final_report,
+                      regime=regime, periphery=periphery_label)
 
     # ── Step 9: 更新記憶層 ────────────────────────────────────────
     logger.info("Step 9: 更新記憶層")
