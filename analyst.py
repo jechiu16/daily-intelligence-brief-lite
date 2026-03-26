@@ -117,9 +117,9 @@ def run_analyst(prompt):
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.7,
-                max_output_tokens=8000,
+                max_output_tokens=12000,
                 thinking_config=types.ThinkingConfig(
-                    thinking_budget=8000
+                    thinking_budget=12000
                 ),
                 tools=[types.Tool(google_search=types.GoogleSearch())],
             ),
