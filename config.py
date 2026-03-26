@@ -15,9 +15,9 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 
 # ── Gemini 模型（2026-03 可用名稱）────────────────────────────────────
-MODEL_ANALYST = "gemini-3.1-pro-preview"               # Analyst: 主推理 + thinking
-MODEL_FLASH = "gemini-3-flash-preview"               # Logic Guardrail + Layer Update
-MODEL_NARRATOR = "gemini-3-flash-preview"       # Narrator: 白話轉譯
+MODEL_ANALYST = "gemini-2.5-pro"               # Analyst: 主推理 + thinking
+MODEL_FLASH = "gemini-2.5-flash"               # Logic Guardrail + Layer Update
+MODEL_NARRATOR = "gemini-2.5-flash-lite"       # Narrator: 白話轉譯
 
 # ── FRED Series ──────────────────────────────────────────────────────
 FRED_SERIES = {
@@ -63,5 +63,5 @@ THESIS_MAX_NEW_PER_DAY = 2
 THESIS_MAX_ACTIVE = 5
 
 # ── Narrator 設定 ────────────────────────────────────────────────────
-NARRATOR_MAX_TOKENS = 4000
-REPORT_MAX_CHARS = 1700  # 約 1700 中文字
+NARRATOR_MAX_TOKENS = 8000
+REPORT_MAX_CHARS = 3000  # 約 1700 中文字
