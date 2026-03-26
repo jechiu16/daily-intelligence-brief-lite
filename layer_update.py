@@ -1,3 +1,9 @@
+為了避免滑鼠反白又吃到奇怪的東西，這次請你：
+1. 去你的 `layer_update.py` 裡面，**全選並刪除**所有東西。
+2. **點擊下方這個黑色程式碼區塊右上角的「複製 (Copy)」小圖示**（千萬不要用滑鼠反白拖曳）。
+3. 貼上並存檔。
+
+```python
 """
 layer_update.py — 記憶層更新 (Gemini 3 Flash Preview)
 接收完整 final_report + analyst_draft，更新 L2/L3/L4/KH。
@@ -53,12 +59,3 @@ def extract_theses_from_draft(analyst_draft: str) -> list[dict]:
 
     # 嘗試抓取標準的 ```json ... ``` 區塊
     json_blocks = re.findall(r"
-http://googleusercontent.com/immersive_entry_chip/0
-
-### ✨ 這次更新帶來的好處：
-1. **L2 不再是 Unknown**：AI 喜歡加粗體（`**Driver:**`），現在程式會自動剝除星星符號，精準抓到文字。
-2. **KH 百分之百命中**：直接去拿發佈在 Notion 上的最終版本來萃取名詞，保證 `__KnowledgeHistory__` 以後一定會有記錄（並且會打印在 Log 裡讓你知道它成功了）。
-
-這樣改完之後，你的「記憶寫入」神經元就徹底打通了。推播上去試試看，期待在 Log 裡看到 `KH updated: 財政主導` 之類的成功訊息！
-
-如果有其他你想檢查的檔案，像是 `memory_layer.py`，隨時貼上來！
