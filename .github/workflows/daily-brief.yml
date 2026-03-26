@@ -2,6 +2,8 @@ name: Daily Intelligence Brief
 
 on:
   schedule:
+    # 目前設定：UTC 23:00 (台灣時間週一到週五早上 07:00)
+    # 若要改台灣晚上 11 點，請改成: - cron: '0 15 * * 1-5'
     - cron: '0 23 * * 0-4'
   workflow_dispatch:
     inputs:
@@ -45,9 +47,13 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         run: |
-          COMMAND="${{ github.event.inputs.command || 'daily' }}"
+          # 使用新版 inputs 語法，排程自動觸發時若為空，預設使用 'daily'
+          COMMAND="${{ inputs.command || 'daily' }}"
+          
           DATE_ARG=""
-          if [ -n "${{ github.event.inputs.date }}" ]; then
-            DATE_ARG="--date ${{ github.event.inputs.date }}"
+          if [ -n "${{ inputs.date }}" ]; then
+            DATE_ARG="--date ${{ inputs.date }}"
           fi
+          
+          echo "Running command: $COMMAND $DATE_ARG"
           python main.py $COMMAND $DATE_ARG
