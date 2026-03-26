@@ -6,6 +6,7 @@ data_layer.py — Layer 0: 資料收集
 import datetime as dt
 import logging
 import json
+import io  # 新增：用來處理記憶體中的檔案讀取
 
 import pandas as pd
 import numpy as np
@@ -266,8 +267,15 @@ def fetch_gdpnow() -> dict:
     result = {}
     try:
         url = "https://www.atlantafed.org/-/media/documents/cqer/researchcq/gdpnow/GDPNowForecast.xlsx"
-        # 修正重點：在這裡加上了 engine='openpyxl'
-        df = pd.read_excel(url, sheet_name="Tracking", header=None, engine='openpyxl')
+        # 加上偽裝成一般瀏覽器的標頭 (User-Agent)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status() # 確定有成功抓到檔案
+
+        # 將記憶體中的二進位資料交給 pandas 解析 (加入 engine='openpyxl')
+        df = pd.read_excel(io.BytesIO(resp.content), sheet_name="Tracking", header=None, engine='openpyxl')
         
         # GDPNow 的 Excel 格式：最新預測值在特定位置
         # 嘗試找到最新的數字
