@@ -15,9 +15,9 @@ NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 
 # ── Gemini 模型（2026-03 可用名稱）────────────────────────────────────
-MODEL_ANALYST = "gemini-3.1-pro"               # Analyst: 主推理 + thinking
-MODEL_FLASH = "gemini-3-flash"               # Logic Guardrail + Layer Update
-MODEL_NARRATOR = "gemini-3-flash"       # Narrator: 白話轉譯
+MODEL_ANALYST = "gemini-3.1-pro-preview"               # Analyst: 主推理 + thinking
+MODEL_FLASH = "gemini-3-flash-preview"               # Logic Guardrail + Layer Update
+MODEL_NARRATOR = "gemini-3-flash-preview"       # Narrator: 白話轉譯
 
 # ── FRED Series ──────────────────────────────────────────────────────
 FRED_SERIES = {
