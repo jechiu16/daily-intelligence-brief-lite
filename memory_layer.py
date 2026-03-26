@@ -79,9 +79,27 @@ def _get_page_content(page_id: str) -> str:
         return ""
 
 
+def _split_to_blocks(content: str, max_chars: int = 1800) -> list[dict]:
+    """將內容切成多個 block，每個不超過 max_chars。"""
+    chunks = []
+    while content:
+        chunk = content[:max_chars]
+        content = content[max_chars:]
+        chunks.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"text": {"content": chunk}}]
+            }
+        })
+    return chunks if chunks else [{"object": "block", "type": "paragraph",
+                                    "paragraph": {"rich_text": [{"text": {"content": ""}}]}}]
+
+
 def _create_page(title: str, content: str) -> Optional[str]:
     """在 database 中建立新 page。"""
     try:
+        children = _split_to_blocks(content)
         resp = httpx.post(
             f"{NOTION_API}/pages",
             headers=NOTION_HEADERS,
@@ -92,16 +110,7 @@ def _create_page(title: str, content: str) -> Optional[str]:
                         "title": [{"text": {"content": title}}]
                     }
                 },
-                "children": [
-                    {
-                        "object": "block",
-                        "type": "code",
-                        "code": {
-                            "rich_text": [{"text": {"content": content[:2000]}}],
-                            "language": "json"
-                        }
-                    }
-                ]
+                "children": children
             },
             timeout=30,
         )
@@ -133,21 +142,11 @@ def _update_page_content(page_id: str, content: str):
             except Exception:
                 pass
 
+        children = _split_to_blocks(content)
         httpx.patch(
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
-            json={
-                "children": [
-                    {
-                        "object": "block",
-                        "type": "code",
-                        "code": {
-                            "rich_text": [{"text": {"content": content[:2000]}}],
-                            "language": "json"
-                        }
-                    }
-                ]
-            },
+            json={"children": children},
             timeout=30,
         )
     except Exception as e:
