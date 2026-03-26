@@ -63,5 +63,5 @@ THESIS_MAX_NEW_PER_DAY = 2
 THESIS_MAX_ACTIVE = 5
 
 # ── Narrator 設定 ────────────────────────────────────────────────────
-NARRATOR_MAX_TOKENS = 8000
+NARRATOR_MAX_TOKENS = 10000
 REPORT_MAX_CHARS = 3000  # 約 1700 中文字
