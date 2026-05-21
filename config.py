@@ -14,10 +14,10 @@ EIA_API_KEY = os.environ.get("EIA_API_KEY", "")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 
-# ── Gemini 模型（2026-03 可用名稱）────────────────────────────────────
-MODEL_ANALYST = "gemini-3.1-pro-preview"               # Analyst: 主推理 + thinking
-MODEL_FLASH = "gemini-2.5-flash"               # Logic Guardrail + Layer Update
-MODEL_NARRATOR = "gemini-2.5-flash"       # Narrator: 白話轉譯
+# ── Gemini 模型 ─────────────────────────────────────────────────────
+MODEL_ANALYST = "gemini-3.5-flash"   # Analyst: 主推理 + grounding
+MODEL_FLASH = "gemini-3.5-flash"     # Logic Guardrail + Layer Update
+MODEL_NARRATOR = "gemini-3.5-flash"  # Narrator: 白話轉譯
 
 # ── FRED Series ──────────────────────────────────────────────────────
 FRED_SERIES = {

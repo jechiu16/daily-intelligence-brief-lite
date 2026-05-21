@@ -1,13 +1,13 @@
 # Daily Intelligence Brief — v9 Lite
 
-每天早上 10-15 分鐘，幫退休人士讀懂世界發生了什麼。
+每天早上 10-15 分鐘，用一篇高品質日報讀懂世界發生了什麼。
 
 ---
 
 ## 讀者定位
 
-退休人士，沒有金融背景，剛開始打理退休資產。
-讀完後的感覺：「我知道今天發生了什麼，我知道跟我有沒有關係，我今天不需要做任何事。」
+受過良好教育、關心世界局勢，但不一定有金融、總經或地緣政治背景的一般讀者。
+讀完後的感覺：「我知道今天世界的主線是什麼，也順手多認識了一個被主流新聞忽略的角落。」
 
 ---
 
@@ -22,9 +22,9 @@ GitHub Actions (每日 UTC 23:00)
         ├── data_layer.py ─────── 10+ API 資料源
         ├── hard_truths.py ────── Regime 分類
         ├── relational_guardrail ─ 9 條跨資產規則 (純 Python)
-        ├── analyst.py ────────── Gemini 3.1 Pro (thinking=high + Grounding)
+        ├── analyst.py ────────── Gemini 3.5 Flash + Grounding
         ├── logic_guardrail.py ── Gemini Flash (事實校驗)
-        ├── narrator.py ───────── Gemini Flash-Lite (白話翻譯)
+        ├── narrator.py ───────── Gemini 3.5 Flash (主筆改寫)
         ├── layer_update.py ───── 記憶層更新
         └── memory_layer.py ───── Notion (L1-L4, KH)
 ```
@@ -69,9 +69,9 @@ Settings → Secrets → 加入 5 個 key → Push → Actions 手動觸發
 | 一、今天的世界 | 50 | 一句話 |
 | 二、數字說了什麼 | 250 | 5 個數字 + 白話 |
 | 三、為什麼會這樣 | 600 | 因果鏈 |
-| 四、誰會受影響 | 300 | 持股/持債/持外幣 |
-| 五、今日邊陲 | 300 | 世界一角 |
-| 六、今日一件事 | 200 | 學一個詞 |
+| 四、這跟我們有什麼關係 | 300 | 理解世界，不做喊單 |
+| 五、今日邊陲 | 300 | 真正邊陲的世界一角 |
+| 六、今日一件事 | 200 | 學一個小知識 |
 
 ---
 

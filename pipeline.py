@@ -7,6 +7,7 @@ import datetime
 import logging
 
 from data_layer import collect_all_data
+from date_utils import taipei_today
 from hard_truths import build_hard_truths, format_level_a, format_level_b, REGIME_FRAMEWORKS
 from relational_guardrail import run_relational_guardrail
 from periphery import select_periphery
@@ -18,6 +19,7 @@ from analyst import build_analyst_prompt, run_analyst
 from logic_guardrail import run_logic_guardrail
 from narrator import run_narrator
 from layer_update import run_layer_update
+from knowledge_terms import select_knowledge_candidates
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,7 @@ def run_daily_pipeline(manual_date: str | None = None) -> str:
     執行完整的每日 pipeline。
     返回最終報告文字。
     """
-    today = manual_date or datetime.date.today().isoformat()
+    today = manual_date or taipei_today().isoformat()
     logger.info(f"═══ Daily Intelligence Brief — {today} ═══")
 
     # ── Step 1: 資料收集 ──────────────────────────────────────────
@@ -63,6 +65,21 @@ def run_daily_pipeline(manual_date: str | None = None) -> str:
     l3 = fetch_layer3()
     kh = fetch_knowledge_history()
 
+    knowledge_context = "\n".join([
+        level_a,
+        level_b,
+        regime,
+        framework,
+        periphery_label,
+        periphery_keywords,
+        " ".join(relational_flags),
+    ])
+    knowledge_candidates = select_knowledge_candidates(
+        knowledge_context,
+        used_terms=kh,
+        limit=8,
+    )
+
     # ── Step 5 & 6: Analyst & Logic Guardrail (具備重試與阻斷機制) ─
     base_analyst_prompt = build_analyst_prompt(
         level_a=level_a,
@@ -76,6 +93,7 @@ def run_daily_pipeline(manual_date: str | None = None) -> str:
         kh=kh,
         periphery_label=periphery_label,
         periphery_keywords=periphery_keywords,
+        knowledge_candidates=knowledge_candidates,
     )
     
     current_prompt = base_analyst_prompt
@@ -157,13 +175,13 @@ def run_weekly_report() -> str:
     # 本週學到的詞
     terms_this_week = [item["term"] for item in kh[-7:]] if kh else []
 
-    prompt = f"""你是 Daily Intelligence Brief 的週報翻譯者。
-讀者是退休人士，語言要溫暖清楚。
+    prompt = f"""你是 Daily Intelligence Brief 的週報主筆。
+讀者是受過良好教育、關心世界局勢，但不一定有金融或總經背景的一般讀者。語言要成熟、清楚、有知識感，不要投資喊單。
 
 ═══ 本週市場結構 (L2) ═══
 {l2}
 
-═══ 現有 Thesis (L3) ═══
+═══ 現有追蹤線索 (L3) ═══
 {[t for t in l3 if t.get('status') == 'active']}
 
 ═══ 本週學到的詞 (KH) ═══
@@ -177,13 +195,13 @@ def run_weekly_report() -> str:
 ## 這週我學到的新詞
 （回顧本週「今日一件事」的術語，每個用一句話複習）
 
-## 下週要留意什麼
-（1-2 個，不超過。從 L3 active thesis 中挑選最值得關注的）
+## 下週可以留意什麼
+（1-2 個，不超過。從 L3 active thesis 中挑選最值得關注的世界線索）
 
-📋 這週我需要做什麼嗎？
-（通常是「不需要」或「可以留意 X」）
+📋 這週可以怎麼理解？
+（一句話收束，不給投資指令）
 
-語言：繁體中文，溫暖清楚。
+語言：繁體中文，成熟清楚。
 """
 
     try:

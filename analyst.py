@@ -1,17 +1,36 @@
 """
-analyst.py — Analyst 模組 (Gemini 2.5 Pro)
+analyst.py — Analyst 模組
 """
 
 import logging
 
-from google import genai
-from google.genai import types
-
 from config import GOOGLE_API_KEY, MODEL_ANALYST
+from knowledge_terms import format_knowledge_candidates
 
 logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
+client = None
+
+
+def _get_client():
+    global client
+    if client is None:
+        from google import genai
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+    return client
+
+
+def _build_generate_config():
+    from google.genai import types
+
+    return types.GenerateContentConfig(
+        temperature=0.7,
+        max_output_tokens=12000,
+        thinking_config=types.ThinkingConfig(
+            thinking_budget=12000
+        ),
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+    )
 
 FRAMEWORK_LIBRARY = """
 【貨幣政策】
@@ -36,6 +55,7 @@ Fiscal Dominance: 財政壓力如何侵蝕貨幣政策獨立性？
 def build_analyst_prompt(
     level_a, level_b, relational_flags, regime, framework,
     l1, l2, l3, kh, periphery_label, periphery_keywords,
+    knowledge_candidates=None,
 ):
     l1_block = ""
     if l1.get("yesterday_headline"):
@@ -61,9 +81,11 @@ def build_analyst_prompt(
         for f in relational_flags:
             flags_block += f"  {f}\n"
 
-    return f"""你是 Daily Intelligence Brief 的首席分析師。
-你的任務是對今天的宏觀環境做嚴謹分析，產出結構化草稿。
-這個草稿是給 Narrator（白話翻譯者）用的，不是給讀者看的。你可以用術語。
+    knowledge_block = format_knowledge_candidates(knowledge_candidates or [])
+
+    return f"""你是 Daily Intelligence Brief 的首席分析師兼選題編輯。
+你的任務不是產出一份投資報告，而是為一篇高品質世界日報整理素材：選出今天最值得理解的一條主線，交代市場、政策、地緣或社會變化之間的因果，並保留一個真正邊陲地區的小知識。
+這個草稿是給 Narrator（主筆）用的，不是給讀者看的；你可以使用術語，但必須幫主筆判斷哪些術語值得解釋。
 
 {level_a}
 
@@ -75,23 +97,28 @@ Regime: {regime}
 {FRAMEWORK_LIBRARY}
 {l1_block}{l2_block}{l3_block}{kh_block}
 
+今日一件事候選池（優先從中挑選）：
+{knowledge_block}
+
 今日邊陲地區：{periphery_label}
 邊陲搜尋關鍵字：{periphery_keywords}
 → 請搜尋這個地區的最新動態，寫入邊陲段落。
+→ 邊陲必須真的是邊陲：避開 G7、中國、台灣、華爾街、矽谷、Fed、歐盟核心等主流資訊中心；重點放在小國、邊境、港口、礦區、島嶼、糧食帶、內陸走廊、治理破碎地區。
+→ 如果它和今日市場主線沒有直接關係，請坦白說沒有直接關係，再說明它作為世界知識為什麼值得知道；不要硬湊關聯。
 
 ══════════════════════════════════════════════════
 請產出以下結構化草稿（繁體中文）。
 ⚠️ 警告：為了系統寫入資料庫，請【嚴格遵守】以下各區塊的標題與格式，切勿擅自更改！
 
 ## 1. 今天最重要的一件事
-一句話概括。
+一句話概括今天世界最值得理解的主線。可以來自市場，但不要寫成交易建議。
 
 ## 2. 完整因果鏈
-用「因為...所以...」邏輯串連。包含框架名稱。
+用「因為...所以...」邏輯串連。包含框架名稱，但避免堆術語。重點是讓主筆能寫成一篇有節奏的文章。
 
-## 3. 誰受影響
-分三類：持有股票的人 / 持有債券或定存的人 / 持有外幣的人
-每類標記：🔴需要關注 / 🟡保持觀察 / 🟢目前穩定
+## 3. 讀者該如何理解
+用三點整理這件事對一般讀者理解世界有什麼幫助。
+不要假設讀者正在操作股票、債券或外匯；可以提到資產價格，但語氣是解釋世界，不是投資喊單。
 
 ## 4. 結構化攻擊 (L4 更新)
 選擇 regime_misclassification, second_order_inversion, reflexivity_break, omitted_variable_bias 之一執行。
@@ -101,21 +128,25 @@ Regime: {regime}
 反面訊號：[填入能證明此攻擊成立的市場訊號]
 
 ## 5. 今日術語建議 (KH 更新)
-挑選一個今天報告中用到、可以用日常比喻解釋的專業術語（絕對不能是已用列表中的詞彙）。
+挑選一個今天報告中用到、可以用日常比喻解釋的小知識詞彙（絕對不能是已用列表中的詞彙）。
+可以是金融術語、地理概念、歷史背景、國際政治詞、航運/能源/糧食常識；不必侷限於投資詞彙。
+請優先從「今日一件事候選池」中挑選最貼近今日主線或邊陲的詞。
+如果候選池完全不適合，才可以自產一個詞，但必須符合：不太泛、可用三段說清楚、和今日主線或邊陲有明確關係。
 ⚠️ 必須嚴格使用以下格式：
 今日術語：[填入單一名詞]
 
 ## 6. 邊陲段落：{periphery_label}
-在哪、多少人、正在發生什麼、跟市場有沒有關係。
+在哪、多少人、最近正在發生什麼、它提醒我們世界哪個被忽略的面向。
+如果跟今天市場沒有直接關係，請明確寫「沒有直接關係」，不要硬湊。
 
-## 7. Thesis 更新 (L3 更新)
-基於今日市場動態，產出 1~2 個全新的投資論點。
+## 7. 文章追蹤線索 (L3 更新)
+基於今日主線，產出 1~2 個後續值得追蹤的世界觀察線索。
 ⚠️ 必須嚴格使用 Markdown JSON 陣列格式，且只包含 name 和 statement 欄位，例如：
 ```json
 [
   {{
-    "name": "US_Fiscal_Dominance_Trade",
-    "statement": "因為財政赤字無法收斂，所以長天期債券存在被拋售風險..."
+    "name": "Red_Sea_Routing_Pressure",
+    "statement": "如果紅海航運風險持續，歐亞貨運時間與保險成本會成為觀察全球供應鏈壓力的線索。"
   }}
 ]
 ```
@@ -131,19 +162,12 @@ fragility: [填入當前市場最脆弱的環節]
 
 
 def run_analyst(prompt):
-    logger.info("Running Analyst (Gemini 2.5 Pro)...")
+    logger.info("Running Analyst...")
     try:
-        response = client.models.generate_content(
+        response = _get_client().models.generate_content(
             model=MODEL_ANALYST,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.7,
-                max_output_tokens=12000,
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=12000
-                ),
-                tools=[types.Tool(google_search=types.GoogleSearch())],
-            ),
+            config=_build_generate_config(),
         )
 
         text_parts = []

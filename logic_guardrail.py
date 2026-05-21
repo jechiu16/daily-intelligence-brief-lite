@@ -4,14 +4,31 @@ logic_guardrail.py — Logic Guardrail (Gemini 2.5 Flash)
 
 import logging
 
-from google import genai
-from google.genai import types
-
 from config import GOOGLE_API_KEY, MODEL_FLASH
 
 logger = logging.getLogger(__name__)
 
-client = genai.Client(api_key=GOOGLE_API_KEY)
+client = None
+
+
+def _get_client():
+    global client
+    if client is None:
+        from google import genai
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+    return client
+
+
+def _build_generate_config():
+    from google.genai import types
+
+    return types.GenerateContentConfig(
+        temperature=0.1,
+        max_output_tokens=1000,
+        thinking_config=types.ThinkingConfig(
+            thinking_budget=1000
+        ),
+    )
 
 
 def build_guardrail_prompt(draft, hard_truths):
@@ -50,16 +67,10 @@ def run_logic_guardrail(draft, hard_truths):
     prompt = build_guardrail_prompt(draft, hard_truths)
 
     try:
-        response = client.models.generate_content(
+        response = _get_client().models.generate_content(
             model=MODEL_FLASH,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                max_output_tokens=1000,
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=1000
-                ),
-            ),
+            config=_build_generate_config(),
         )
 
         result = response.text.strip()
@@ -74,4 +85,4 @@ def run_logic_guardrail(draft, hard_truths):
 
     except Exception as e:
         logger.error(f"Logic Guardrail error: {e}")
-        return True, f"Guardrail error (defaulting to PASS): {e}"
+        return False, f"Guardrail degraded error: {e}"

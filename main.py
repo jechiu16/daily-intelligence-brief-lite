@@ -24,7 +24,7 @@ def main():
     )
     parser.add_argument(
         "command",
-        choices=["daily", "weekly", "test-data", "test-regime"],
+        choices=["daily", "weekly", "test-data", "test-regime", "doctor"],
         help="daily=每日報告, weekly=週報, test-data=測試資料收集, test-regime=測試 regime 分類",
     )
     parser.add_argument(
@@ -37,7 +37,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "daily":
+        from preflight import run_preflight
         from pipeline import run_daily_pipeline
+        run_preflight()
         report = run_daily_pipeline(manual_date=args.date)
         print("\n" + "=" * 60)
         print("FINAL REPORT")
@@ -80,6 +82,11 @@ def main():
             print("⚡ Relational Flags:")
             for f in flags:
                 print(f"  {f}")
+
+    elif args.command == "doctor":
+        from preflight import run_preflight
+        run_preflight()
+        print("Preflight OK")
 
 
 if __name__ == "__main__":

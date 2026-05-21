@@ -285,7 +285,7 @@ def _create_page_simple(title: str, content: str, is_code: bool = False) -> Opti
         return resp.json()["id"]
     except Exception as e:
         logger.error(f"Notion create page error: {e}")
-        return None
+        raise
 
 
 def _update_page_content(page_id: str, content: str, is_code: bool = False):
@@ -297,22 +297,22 @@ def _update_page_content(page_id: str, content: str, is_code: bool = False):
         )
         resp.raise_for_status()
         for block in resp.json().get("results", []):
-            try:
-                httpx.delete(f"{NOTION_API}/blocks/{block['id']}",
-                             headers=NOTION_HEADERS, timeout=15)
-            except Exception:
-                pass
+            delete_resp = httpx.delete(f"{NOTION_API}/blocks/{block['id']}",
+                                       headers=NOTION_HEADERS, timeout=15)
+            delete_resp.raise_for_status()
 
         blocks = _get_blocks_for_content(content, is_code)
 
-        httpx.patch(
+        patch_resp = httpx.patch(
             f"{NOTION_API}/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
             json={"children": blocks[:100]},
             timeout=30,
         )
+        patch_resp.raise_for_status()
     except Exception as e:
         logger.error(f"Notion update error: {e}")
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -506,29 +506,30 @@ def save_daily_report(date: str, report: str,
 
     if page_id:
         try:
-            httpx.patch(
+            resp = httpx.patch(
                 f"{NOTION_API}/pages/{page_id}",
                 headers=NOTION_HEADERS,
                 json={"properties": properties},
                 timeout=30,
             )
+            resp.raise_for_status()
             resp = httpx.get(f"{NOTION_API}/blocks/{page_id}/children",
                              headers=NOTION_HEADERS, timeout=30)
             resp.raise_for_status()
             for block in resp.json().get("results", []):
-                try:
-                    httpx.delete(f"{NOTION_API}/blocks/{block['id']}",
-                                 headers=NOTION_HEADERS, timeout=15)
-                except Exception:
-                    pass
-            httpx.patch(
+                delete_resp = httpx.delete(f"{NOTION_API}/blocks/{block['id']}",
+                                           headers=NOTION_HEADERS, timeout=15)
+                delete_resp.raise_for_status()
+            resp = httpx.patch(
                 f"{NOTION_API}/blocks/{page_id}/children",
                 headers=NOTION_HEADERS,
                 json={"children": children},
                 timeout=30,
             )
+            resp.raise_for_status()
         except Exception as e:
             logger.error(f"Notion update report error: {e}")
+            raise
     else:
         try:
             resp = httpx.post(
@@ -564,7 +565,9 @@ def save_daily_report(date: str, report: str,
                 logger.info(f"Report created (fallback) in Notion: {title}")
             except Exception as e2:
                 logger.error(f"Notion fallback create also failed: {e2}")
+                raise
         except Exception as e:
             logger.error(f"Notion create report error: {e}")
+            raise
 
     logger.info(f"Report saved to Notion: {title}")

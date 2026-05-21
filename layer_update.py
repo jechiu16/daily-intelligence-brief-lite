@@ -7,18 +7,13 @@ import json
 import logging
 import re
 
-from google import genai
-from google.genai import types
-
-from config import GOOGLE_API_KEY, MODEL_FLASH, THESIS_MAX_ACTIVE
+from config import THESIS_MAX_ACTIVE
 from memory_layer import (
     update_layer2, update_layer3, update_layer4,
     update_knowledge_history, fetch_layer3,
 )
 
 logger = logging.getLogger(__name__)
-
-client = genai.Client(api_key=GOOGLE_API_KEY)
 
 
 def extract_l2_from_draft(analyst_draft: str, today_date: str) -> dict:

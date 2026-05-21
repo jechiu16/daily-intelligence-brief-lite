@@ -1,44 +1,72 @@
 """
 periphery.py — 邊陲訊號系統
-32 個地區池，每天根據日期 hash 選一個。
+
+每天選一個資訊密度較低、主流媒體較少深入處理的地方。
+這個欄位的價值不是補充大國新聞，而是讓日報保留世界感。
 """
 
 import datetime
 import hashlib
 
+PERIPHERY_SELECTION_RULE = (
+    "邊陲必須避開已被主流資訊淹沒的大國與金融中心；優先選邊境地帶、"
+    "小國、內陸走廊、港口、礦區、糧食帶、航道、島嶼與治理破碎地區。"
+)
+
+
 PERIPHERY_POOL: list[tuple[str, str]] = [
-    ("薩赫勒 + 西非",      "Sahel West Africa security governance"),
-    ("高加索",             "Caucasus Armenia Azerbaijan Georgia conflict"),
-    ("緬甸內戰",           "Myanmar civil war junta resistance"),
-    ("葉門",               "Yemen Houthi Red Sea conflict ceasefire"),
-    ("伊拉克 + 敘利亞",    "Iraq Syria border militia Iran proxy"),
-    ("黎巴嫩重建",         "Lebanon reconstruction Hezbollah economy"),
-    ("利比亞",             "Libya fragmentation warlords oil"),
-    ("蘇丹內戰",           "Sudan civil war RSF SAF humanitarian"),
-    ("索馬利亞",           "Somalia Horn of Africa al-Shabaab"),
-    ("越南",               "Vietnam manufacturing FDI supply chain"),
-    ("孟加拉",             "Bangladesh garment political transition"),
-    ("衣索比亞",           "Ethiopia economy reconstruction growth"),
-    ("哈薩克",             "Kazakhstan energy China Russia"),
-    ("墨西哥",             "Mexico nearshoring manufacturing US trade"),
-    ("印尼",               "Indonesia nickel EV supply chain"),
-    ("奈及利亞",           "Nigeria oil currency reform economy"),
-    ("剛果銅鈷礦帶",       "DRC Congo copper cobalt mining China"),
-    ("智利阿根廷鋰三角",   "Chile Argentina lithium EV battery"),
-    ("哈薩克烏茲別克鈾礦", "Kazakhstan Uzbekistan uranium nuclear"),
-    ("圭亞那",             "Guyana offshore oil ExxonMobil"),
-    ("莫三比克 LNG",       "Mozambique LNG insurgency Cabo Delgado"),
-    ("麻六甲海峽",         "Malacca Strait shipping chokepoint"),
-    ("博斯普魯斯 + 黑海",  "Bosphorus Black Sea Turkey grain Ukraine"),
-    ("巴拿馬運河",         "Panama Canal drought water shipping"),
-    ("亞丁灣 + 紅海",     "Aden Gulf Red Sea Houthi shipping"),
-    ("湄公河",             "Mekong River China dams downstream water"),
-    ("東非農業帶",         "East Africa drought food security"),
-    ("巴基斯坦",           "Pakistan climate economy IMF"),
-    ("泰國政治",           "Thailand politics judiciary military"),
-    ("秘魯玻利維亞",       "Peru Bolivia resource nationalism mining"),
-    ("塞爾維亞",           "Serbia EU Russia Balkans geopolitics"),
-    ("喬治亞",             "Georgia democracy protests EU"),
+    ("薩赫勒三角地帶",      "Sahel Mali Niger Burkina Faso security governance"),
+    ("查德湖盆地",          "Lake Chad Basin security climate displacement"),
+    ("幾內亞灣海盜帶",      "Gulf of Guinea piracy oil shipping security"),
+    ("蘇丹達佛與科爾多凡",  "Sudan Darfur Kordofan RSF SAF humanitarian"),
+    ("索馬利亞邦特蘭",      "Puntland Somalia piracy Islamic State shipping"),
+    ("索馬利蘭",            "Somaliland Berbera port Ethiopia recognition"),
+    ("衣索比亞奧羅米亞",    "Ethiopia Oromia conflict economy"),
+    ("莫三比克德爾加杜角",  "Cabo Delgado Mozambique LNG insurgency"),
+    ("馬達加斯加南部",      "southern Madagascar drought food security"),
+    ("葛摩與莫三比克海峽",  "Comoros Mozambique Channel shipping gas geopolitics"),
+    ("剛果銅鈷礦帶",        "DRC Katanga copper cobalt mining power shortages"),
+    ("尚比亞銅帶",          "Zambia Copperbelt debt power mining"),
+    ("安哥拉洛比托走廊",    "Lobito Corridor Angola Zambia DRC railway copper"),
+    ("圭亞那內陸與離岸油田","Guyana Essequibo offshore oil Venezuela border"),
+    ("蘇利南離岸油氣",      "Suriname offshore oil politics economy"),
+    ("秘魯南部礦區",        "southern Peru mining protests copper"),
+    ("玻利維亞鋰鹽湖",      "Bolivia lithium salt flats politics extraction"),
+    ("巴拉圭大豆邊境",      "Paraguay soybean Brazil border hydropower"),
+    ("貝里斯與瓜地馬拉邊境","Belize Guatemala border dispute Caribbean"),
+    ("達連隘口",            "Darien Gap migration Panama Colombia"),
+    ("瓜地馬拉高地",        "Guatemala highlands migration drought coffee"),
+    ("緬甸撣邦與若開",      "Myanmar Shan Rakhine civil war rare earth ports"),
+    ("克欽稀土礦區",        "Kachin Myanmar rare earth mining China border"),
+    ("孟加拉吉大港丘陵",    "Chittagong Hill Tracts Bangladesh insurgency"),
+    ("俾路支走廊",          "Balochistan Gwadar CPEC insurgency"),
+    ("吉爾吉斯塔吉克邊境",  "Kyrgyzstan Tajikistan border water conflict"),
+    ("費爾干納谷地",        "Fergana Valley water borders Central Asia"),
+    ("卡拉卡爾帕克斯坦",    "Karakalpakstan Aral Sea Uzbekistan autonomy"),
+    ("亞美尼亞南部走廊",    "Syunik Armenia Zangezur corridor Azerbaijan"),
+    ("喬治亞黑海港口",      "Georgia Black Sea Anaklia port EU Russia"),
+    ("摩爾多瓦德涅斯特河左岸","Transnistria Moldova energy security"),
+    ("波士尼亞塞族共和國",  "Republika Srpska Bosnia secession EU"),
+    ("科索沃北部",          "northern Kosovo Serbia tensions municipalities"),
+    ("塞浦路斯綠線",        "Cyprus Green Line gas Turkey EU"),
+    ("黎巴嫩南部",          "southern Lebanon border economy Hezbollah Israel"),
+    ("伊拉克辛賈爾",        "Sinjar Iraq Yazidi militias Turkey PKK"),
+    ("敘利亞東北部",        "northeast Syria oil wheat SDF Turkey"),
+    ("約旦河谷",            "Jordan Valley water agriculture security"),
+    ("葉門塔伊茲與荷台達",  "Yemen Taiz Hodeidah Red Sea humanitarian"),
+    ("阿曼杜庫姆港",        "Duqm Oman port Indian Ocean logistics"),
+    ("亞丁灣小港口",        "Gulf of Aden ports shipping security"),
+    ("紅海西岸港口",        "Eritrea Sudan Red Sea ports shipping"),
+    ("吉布地港口群",        "Djibouti ports military bases debt"),
+    ("馬爾地夫海上通道",    "Maldives Indian Ocean debt climate China India"),
+    ("安達曼尼科巴外海",    "Andaman Nicobar Bay of Bengal shipping chokepoint"),
+    ("湄公河下游三角洲",    "Mekong Delta salinity rice climate Vietnam Cambodia"),
+    ("寮國水壩走廊",        "Laos Mekong dams debt electricity Thailand"),
+    ("東帝汶大日昇氣田",    "Timor-Leste Greater Sunrise gas Australia"),
+    ("巴布亞紐幾內亞高地",  "Papua New Guinea highlands LNG tribal conflict"),
+    ("索羅門群島",          "Solomon Islands ports China Australia politics"),
+    ("新喀里多尼亞鎳礦",    "New Caledonia nickel unrest France"),
+    ("斐濟與太平洋海底電纜","Fiji Pacific subsea cables geopolitics"),
 ]
 
 

@@ -8,6 +8,16 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _number_or_default(value, default: float = 0.0) -> float:
+    """Return a numeric value, falling back when upstream data is missing."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 # ─────────────────────────────────────────────────────────────────────
 # Regime 分類
 # ─────────────────────────────────────────────────────────────────────
@@ -22,8 +32,8 @@ def classify_regime(h: dict) -> str:
     curve_inverted = h.get("yield_curve_inverted", False)
     credit_stress  = h.get("credit_stress", False)
     spx_up         = h.get("SPX_direction") == "up"
-    inflation_high = h.get("forward_5y5y", 2.0) > 2.5
-    fed_cutting    = (h.get("fed_cuts_priced_in") or 0) > 1
+    inflation_high = _number_or_default(h.get("forward_5y5y"), 2.0) > 2.5
+    fed_cutting    = _number_or_default(h.get("fed_cuts_priced_in"), 0) > 1
     cli_slowing    = h.get("oecd_cli_direction") in ("slowing", "contracting")
 
     if credit_stress and not spx_up:
@@ -48,11 +58,13 @@ def classify_regime(h: dict) -> str:
 def compute_real_yield_direction(current: Optional[float],
                                   previous: Optional[float] = None) -> str:
     """計算實質利率方向。"""
-    if current is None:
+    if current is None or previous is None:
         return "flat"
-    if previous is None:
+    current_value = _number_or_default(current, None)
+    previous_value = _number_or_default(previous, None)
+    if current_value is None or previous_value is None:
         return "flat"
-    diff = current - previous
+    diff = current_value - previous_value
     if diff > 0.03:
         return "up"
     elif diff < -0.03:
@@ -66,8 +78,8 @@ def compute_real_yield_direction(current: Optional[float],
 
 def compute_fiscal_dominance(h: dict) -> bool:
     """debt/GDP > 100% 且赤字擴張 → fiscal dominance risk。"""
-    debt_gdp = h.get("imf_us_debt_gdp")
-    fiscal_bal = h.get("imf_us_fiscal_balance")
+    debt_gdp = _number_or_default(h.get("imf_us_debt_gdp"), None)
+    fiscal_bal = _number_or_default(h.get("imf_us_fiscal_balance"), None)
 
     if debt_gdp is None or fiscal_bal is None:
         return False
@@ -92,7 +104,7 @@ def build_hard_truths(raw_data: dict,
     h["fiscal_dominance_risk"] = compute_fiscal_dominance(h)
 
     # Liquidity direction (需要歷史比較，暫時用 net_liquidity_change)
-    net_liq_change = h.get("net_liquidity_change", 0)
+    net_liq_change = _number_or_default(h.get("net_liquidity_change"), 0)
     if net_liq_change > 10:
         h["liquidity_direction"] = "injecting"
     elif net_liq_change < -10:
@@ -187,7 +199,7 @@ def format_level_b(h: dict) -> str:
         lines.append(f"⚠️ COT 極端倉位: {', '.join(cot)}")
 
     # 流動性大幅變化
-    net_liq_change = h.get("net_liquidity_change", 0)
+    net_liq_change = _number_or_default(h.get("net_liquidity_change"), 0)
     if abs(net_liq_change) > 30:
         lines.append(f"⚠️ 淨流動性週變化: ${net_liq_change:.0f}B")
 
